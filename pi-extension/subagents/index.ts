@@ -15,8 +15,8 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import {
-  isMuxAvailable,
-  muxSetupHint,
+  isBackgroundSurface,
+  isTmuxAvailable,
   createSurface,
   sendCommand,
   sendLongCommand,
@@ -272,11 +272,11 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
 }
 
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!match) return null;
 
   const frontmatter = match[1];
-  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+  const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n*/, "").trim();
   const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
 
   return {
@@ -501,18 +501,6 @@ function getShellReadyDelayMs(): number {
   const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
   const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
-}
-
-function muxUnavailableResult() {
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: `Subagents require tmux. ${muxSetupHint()}`,
-      },
-    ],
-    details: { error: "tmux not available" },
-  };
 }
 
 /**
@@ -895,6 +883,16 @@ function buildPiPromptArgs(params: {
   ];
 }
 
+function buildRpcInput(messages: string[]): string {
+  return messages
+    .filter((message) => message.length > 0)
+    .map((message, index) => JSON.stringify({
+      type: index === 0 ? "prompt" : "follow_up",
+      message,
+    }))
+    .join("\n");
+}
+
 function activityLabel(activity: SubagentActivityState): string | undefined {
   if (activity.phase !== "active") return undefined;
   if (activity.activeScope === "tool") return activity.toolName ?? "tool";
@@ -1008,7 +1006,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
+        `Failed to deliver message to subagent "${running.name}": ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1131,6 +1129,7 @@ export const __test__ = {
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
+  buildRpcInput,
   formatWidgetRightLabel,
   observeRunningSubagent,
   getToolExtensionPath,
@@ -1205,9 +1204,10 @@ async function launchSubagent(
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
+  if (!surfacePreCreated && isTmuxAvailable()) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
+  const background = isBackgroundSurface(surface);
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
@@ -1229,7 +1229,9 @@ async function launchSubagent(
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
   const modeHint = agentDefs?.autoExit
     ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
-    : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
+    : background
+      ? "Complete your task. The orchestrator can interact with you through messages while your background session remains open."
+      : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
   const summaryInstruction = agentDefs?.autoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
@@ -1317,6 +1319,7 @@ async function launchSubagent(
   // Build pi command
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
+  if (background) parts.push("--mode", "rpc");
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
@@ -1401,12 +1404,16 @@ async function launchSubagent(
     taskArg = `@${artifactPath}`;
   }
 
-  for (const promptArg of buildPiPromptArgs({
+  const promptArgs = buildPiPromptArgs({
     effectiveSkills,
     taskDelivery: launchBehavior.taskDelivery,
-    taskArg,
-  })) {
-    parts.push(shellEscape(promptArg));
+    taskArg: background ? fullTask : taskArg,
+  });
+  const initialInput = background ? buildRpcInput(promptArgs) : undefined;
+  if (!background) {
+    for (const promptArg of promptArgs) {
+      parts.push(shellEscape(promptArg));
+    }
   }
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
@@ -1430,6 +1437,7 @@ async function launchSubagent(
       `# Session: ${subagentSessionFile}`,
       `# Surface: ${surface}`,
     ].join("\n"),
+    initialInput,
   });
 
   const running: RunningSubagent = {
@@ -1685,14 +1693,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Spawn a sub-agent asynchronously. Uses a dedicated tmux pane when available, otherwise a universal background process. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        "Spawn a sub-agent asynchronously in a tmux pane or universal background process. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -1758,12 +1766,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Validate prerequisites (need mux + a session file to derive the
-        // artifact dir that hosts this session's name registry).
-        if (!isMuxAvailable()) {
-          return muxUnavailableResult();
-        }
-
+        // A session file is needed to derive the artifact directory that
+        // hosts this session's persistent name registry.
         if (!ctx.sessionManager.getSessionFile()) {
           return {
             content: [
@@ -2078,10 +2082,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        if (!isMuxAvailable()) {
-          return muxUnavailableResult();
-        }
-
         // ── Steer a running subagent ──
         // A name that matches a currently-running subagent always steers it.
         const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
@@ -2150,10 +2150,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
         const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        if (isTmuxAvailable()) {
+          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        }
+        const background = isBackgroundSurface(surface);
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath)];
+        if (background) parts.push("--mode", "rpc");
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -2182,7 +2186,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, message, "utf8");
-          parts.push(shellEscape(`@${resumeMsgFile}`));
+          if (!background) parts.push(shellEscape(`@${resumeMsgFile}`));
         }
 
         // Build env prefix — replay the snapshot's config dir + spawn whitelist
@@ -2232,6 +2236,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `# Surface: ${surface}`,
             ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
           ].join("\n"),
+          initialInput: background && resumeMsgFile
+            ? buildRpcInput([message])
+            : undefined,
         });
 
         // Register as a running subagent for widget tracking

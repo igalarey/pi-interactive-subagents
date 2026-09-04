@@ -30,7 +30,15 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import {
+  closeSurface,
+  createBackgroundSurface,
+  pollForExit,
+  readScreen,
+  sendCommand,
+  sendLongCommand,
+  shellEscape,
+} from "../pi-extension/subagents/tmux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -1206,13 +1214,19 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps custom tools and skips built-ins", () => {
-    assert.equal(testApi.getToolExtensionPath("read"), undefined);
-    assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
-    // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+  it("getToolExtensionPath maps custom tools and skips built-ins", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      const webSearch = join(globalDir, "extensions", "web-search", "index.ts");
+      mkdirSync(join(globalDir, "extensions", "web-search"), { recursive: true });
+      writeFileSync(webSearch, "export default () => {};\n");
+
+      assert.equal(testApi.getToolExtensionPath("read"), undefined);
+      assert.equal(testApi.getToolExtensionPath("bash"), undefined);
+      assert.equal(testApi.getToolExtensionPath("web_search"), webSearch);
+      assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith(join("tools", "safe-bash.ts")));
+      // Spawning tools are registered by this extension itself.
+      assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -1362,6 +1376,16 @@ describe("subagent discovery", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: "do the task" }),
       ["/skill:review", "do the task"],
+    );
+  });
+
+  it("buildRpcInput prompts once and queues later messages", () => {
+    assert.equal(
+      testApi.buildRpcInput(["", "/skill:review", "do the task"]),
+      [
+        JSON.stringify({ type: "prompt", message: "/skill:review" }),
+        JSON.stringify({ type: "follow_up", message: "do the task" }),
+      ].join("\n"),
     );
   });
 
@@ -2652,7 +2676,34 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("tmux.ts", () => {
+describe("surface layer", () => {
+  it("runs and steers a background process through JSONL stdin", async () => {
+    const dir = createTestDir();
+    const surface = createBackgroundSurface();
+    try {
+      sendLongCommand(
+        surface,
+        "IFS= read -r first; IFS= read -r second; printf '%s\\n%s\\n' \"$first\" \"$second\"",
+        {
+          scriptPath: join(dir, "background.sh"),
+          initialInput: JSON.stringify({ type: "prompt", message: "start" }),
+        },
+      );
+      sendCommand(surface, "continue");
+
+      const result = await pollForExit(surface, new AbortController().signal, { interval: 10 });
+      assert.equal(result.exitCode, 0);
+      const output = readScreen(surface, 10);
+      assert.match(output, /"type":"prompt"/);
+      assert.match(output, /"type":"prompt"/);
+      assert.match(output, /"streamingBehavior":"steer"/);
+      assert.match(output, /"message":"continue"/);
+    } finally {
+      closeSurface(surface);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");

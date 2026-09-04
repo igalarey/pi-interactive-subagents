@@ -1,18 +1,24 @@
 /**
- * tmux surface layer — the only terminal multiplexer this extension supports.
- *
- * Everything the extension does to a pane goes through the small API in this
- * file: create/split a pane, type a command into it, read its screen, close
- * it, and poll for exit. Keeping the tmux calls isolated here means index.ts
- * stays testable without a multiplexer running.
- *
- * Panes are identified by tmux pane ids (e.g. `%12`). Splits always target
- * the parent pi's pane (`$TMUX_PANE`) so they follow the agent rather than
- * the user's focus.
+ * Subagent surface layer. tmux panes are preferred when available; otherwise
+ * commands run as background child processes with RPC input and file-backed
+ * output. The fallback has no visible pane, but preserves async execution,
+ * steering, status tracking, and result delivery in any parent terminal.
  */
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  closeSync,
+  createWriteStream,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  rmSync,
+  writeFileSync,
+  type WriteStream,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -51,13 +57,9 @@ export function isMuxAvailable(): boolean {
   return isTmuxAvailable();
 }
 
-export function muxSetupHint(): string {
-  return "Start pi inside tmux (`tmux new -A -s pi 'pi'`).";
-}
-
 function requireTmux(): void {
   if (!isTmuxAvailable()) {
-    throw new Error(`tmux is required for subagents. ${muxSetupHint()}`);
+    throw new Error("This surface operation requires pi to run inside tmux");
   }
 }
 
@@ -106,14 +108,32 @@ function rebalanceSurfaces(hintPane?: string): void {
 
 // ── Surface primitives ──
 
+type BackgroundSurface = {
+  child?: ChildProcess;
+  outputFile?: string;
+  outputStream?: WriteStream;
+  exitCode?: number;
+  spawnError?: string;
+};
+
+const BACKGROUND_PREFIX = "process:";
+const backgroundSurfaces = new Map<string, BackgroundSurface>();
+
+export function isBackgroundSurface(surface: string): boolean {
+  return surface.startsWith(BACKGROUND_PREFIX);
+}
+
+export function createBackgroundSurface(): string {
+  const surface = `${BACKGROUND_PREFIX}${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+  backgroundSurfaces.set(surface, {});
+  return surface;
+}
+
 /**
- * Create a new pane for a subagent: a right split off the parent pi's pane,
- * so new panes follow the agent rather than the user's focus.
- * See https://github.com/HazAT/pi-interactive-subagents/issues/12
- *
- * Returns the new pane id (e.g. `%12`).
+ * Create a tmux pane when possible, otherwise reserve a background process.
  */
 export function createSurface(name: string): string {
+  if (!isTmuxAvailable()) return createBackgroundSurface();
   void name; // tmux panes are not named; the pi process inside shows its own title.
   return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
 }
@@ -159,6 +179,20 @@ export function createSurfaceSplit(
  * then submitted with Enter.
  */
 export function sendCommand(surface: string, command: string): void {
+  if (isBackgroundSurface(surface)) {
+    const state = backgroundSurfaces.get(surface);
+    const stdin = state?.child?.stdin;
+    if (!state || !stdin || stdin.destroyed || !stdin.writable) {
+      throw new Error("Background subagent input is not writable");
+    }
+    stdin.write(JSON.stringify({
+      type: "prompt",
+      message: command,
+      streamingBehavior: "steer",
+    }) + "\n");
+    return;
+  }
+
   requireTmux();
   execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
   execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
@@ -178,7 +212,7 @@ export function sendCommand(surface: string, command: string): void {
 export function sendLongCommand(
   surface: string,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: { scriptPath?: string; scriptPreamble?: string; initialInput?: string },
 ): string {
   const scriptPath =
     options?.scriptPath ??
@@ -198,14 +232,75 @@ export function sendLongCommand(
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
   });
+
+  if (isBackgroundSurface(surface)) {
+    const state = backgroundSurfaces.get(surface);
+    if (!state) throw new Error(`Unknown background surface: ${surface}`);
+
+    const outputFile = `${scriptPath}.log`;
+    const outputStream = createWriteStream(outputFile, { flags: "a" });
+    const shellScriptPath = process.platform === "win32" ? scriptPath.replace(/\\/g, "/") : scriptPath;
+    const child = spawn("bash", [shellScriptPath], {
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    state.child = child;
+    state.outputFile = outputFile;
+    state.outputStream = outputStream;
+    child.stdout?.pipe(outputStream, { end: false });
+    child.stderr?.pipe(outputStream, { end: false });
+    child.stdin?.on("error", () => {});
+    outputStream.on("error", (error) => {
+      state.spawnError = `Failed to capture background output: ${error.message}`;
+      state.exitCode = 1;
+      child.kill("SIGTERM");
+    });
+    child.once("error", (error) => {
+      state.spawnError = error.message;
+    });
+    child.once("close", (code) => {
+      outputStream.end(() => {
+        state.exitCode = code ?? (state.spawnError ? 1 : 0);
+      });
+    });
+
+    if (options?.initialInput) {
+      const input = options.initialInput.endsWith("\n")
+        ? options.initialInput
+        : `${options.initialInput}\n`;
+      child.stdin?.write(input);
+    }
+    return scriptPath;
+  }
+
   sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
 
+function readBackgroundOutput(surface: string, lines: number): string {
+  const outputFile = backgroundSurfaces.get(surface)?.outputFile;
+  if (!outputFile || !existsSync(outputFile)) return "";
+
+  const fd = openSync(outputFile, "r");
+  try {
+    const size = fstatSync(fd).size;
+    const maxBytes = 256 * 1024;
+    const start = Math.max(0, size - maxBytes);
+    const buffer = Buffer.alloc(size - start);
+    readSync(fd, buffer, 0, buffer.length, start);
+    return buffer.toString("utf8").split(/\r?\n/).slice(-Math.max(1, lines)).join("\n");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /**
- * Read the screen contents of a pane (sync).
+ * Read the screen or background log contents (sync).
  */
 export function readScreen(surface: string, lines = 50): string {
+  if (isBackgroundSurface(surface)) return readBackgroundOutput(surface, lines);
   requireTmux();
   return execFileSync(
     "tmux",
@@ -217,9 +312,10 @@ export function readScreen(surface: string, lines = 50): string {
 }
 
 /**
- * Read the screen contents of a pane (async).
+ * Read the screen or background log contents (async).
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
+  if (isBackgroundSurface(surface)) return readBackgroundOutput(surface, lines);
   requireTmux();
   const { stdout } = await execFileAsync(
     "tmux",
@@ -230,9 +326,29 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 }
 
 /**
- * Close a pane.
+ * Close a pane or terminate a background process tree.
  */
 export function closeSurface(surface: string): void {
+  if (isBackgroundSurface(surface)) {
+    const state = backgroundSurfaces.get(surface);
+    const child = state?.child;
+    if (child?.pid && child.exitCode === null) {
+      try {
+        if (process.platform === "win32") {
+          execFileSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+        } else {
+          process.kill(-child.pid, "SIGTERM");
+        }
+      } catch {
+        child.kill("SIGTERM");
+      }
+    }
+    child?.stdin?.destroy();
+    state?.outputStream?.destroy();
+    backgroundSurfaces.delete(surface);
+    return;
+  }
+
   requireTmux();
   execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
   rebalanceSurfaces();
@@ -312,6 +428,13 @@ export async function pollForExit(
           return { reason: "sentinel", exitCode: 0 };
         }
       } catch {}
+    }
+
+    const background = backgroundSurfaces.get(surface);
+    if (background?.exitCode !== undefined) {
+      return background.spawnError
+        ? { reason: "error", exitCode: background.exitCode, errorMessage: background.spawnError }
+        : { reason: "sentinel", exitCode: background.exitCode };
     }
 
     // Slow path: read terminal screen for sentinel (crash detection)
