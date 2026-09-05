@@ -136,25 +136,35 @@ const SubagentParams = Type.Object({
 const ImplementationRouteParams = Type.Object({
   task: Type.String({ description: "The outcome the user requested" }),
   alreadyUnderstood: Type.Boolean({
-    description: "Whether the current session already understands the required change",
+    description: "Whether the current session already understands the required change; informational only",
   }),
   filesToUnderstand: Type.Optional(
     Type.Integer({
       minimum: 0,
-      description: "Estimated files needed to understand the current action, not a risk score",
+      description: "Informational estimate of files needed to understand the current action; does not select delegation",
     }),
   ),
   filesToImplement: Type.Optional(
     Type.Integer({
       minimum: 0,
-      description: "Estimated non-trivial files to change in the current action",
+      description: "Informational estimate of non-trivial files to change; does not select delegation",
     }),
   ),
   mechanical: Type.Optional(
-    Type.Boolean({ description: "Whether the already-understood change is mechanical" }),
+    Type.Boolean({ description: "Whether the bounded change is mechanical" }),
   ),
-  needsResearch: Type.Optional(Type.Boolean({ description: "Whether broad external research is needed" })),
-  ambiguous: Type.Optional(Type.Boolean({ description: "Whether substantial ambiguity remains" })),
+  needsResearch: Type.Optional(
+    Type.Boolean({ description: "Whether broad multi-source external research is needed" }),
+  ),
+  broadExploration: Type.Optional(
+    Type.Boolean({ description: "Whether genuinely broad codebase exploration needs a separate context" }),
+  ),
+  independentWork: Type.Optional(
+    Type.Boolean({ description: "Whether an independent work item justifies a separate context" }),
+  ),
+  ambiguous: Type.Optional(
+    Type.Boolean({ description: "Whether a focused question is needed to resolve material ambiguity" }),
+  ),
   durablePlanningUseful: Type.Optional(
     Type.Boolean({ description: "Whether durable proposal/spec/design/task artifacts would reduce uncertainty" }),
   ),
@@ -1920,10 +1930,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     description:
       "Choose the smallest useful implementation route from explicit scope facts. " +
       "Returns direct, delegated, or SDD guidance; it never launches an agent, edits files, or accepts a proposed SDD workflow. " +
-      "Use delegated for broad exploration/research or multi-file implementation, and propose SDD only when ambiguity or durable planning materially matters.",
+      "File counts and unfamiliarity are informational: delegate only genuinely broad exploration, broad multi-source research, or independent work that warrants separate context. " +
+      "Bounded ambiguity stays direct with a focused question; propose SDD only when durable planning would materially help.",
     promptSnippet:
       "Select the smallest implementation route from explicit scope facts. " +
-      "This is advisory: it does not launch agents or edit files, and a proposed SDD route still needs explicit user acceptance.",
+      "File counts do not trigger delegation; bounded ambiguity stays direct, and a proposed SDD route still needs explicit user acceptance.",
     parameters: ImplementationRouteParams,
 
     renderCall(args, theme) {
@@ -1944,6 +1955,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         filesToImplement: params.filesToImplement,
         mechanical: params.mechanical,
         needsResearch: params.needsResearch,
+        broadExploration: params.broadExploration,
+        independentWork: params.independentWork,
         ambiguous: params.ambiguous,
         durablePlanningUseful: params.durablePlanningUseful,
         sddRequested: params.sddRequested,
@@ -1959,6 +1972,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ...(params.filesToImplement !== undefined ? { filesToImplement: params.filesToImplement } : {}),
             ...(params.mechanical !== undefined ? { mechanical: params.mechanical } : {}),
             ...(params.needsResearch !== undefined ? { needsResearch: params.needsResearch } : {}),
+            ...(params.broadExploration !== undefined ? { broadExploration: params.broadExploration } : {}),
+            ...(params.independentWork !== undefined ? { independentWork: params.independentWork } : {}),
             ...(params.ambiguous !== undefined ? { ambiguous: params.ambiguous } : {}),
             ...(params.durablePlanningUseful !== undefined ? { durablePlanningUseful: params.durablePlanningUseful } : {}),
             ...(params.sddRequested !== undefined ? { sddRequested: params.sddRequested } : {}),

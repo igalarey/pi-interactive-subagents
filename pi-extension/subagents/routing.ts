@@ -8,6 +8,8 @@ export interface ImplementationRouteFacts {
   filesToImplement?: number;
   mechanical?: boolean;
   needsResearch?: boolean;
+  broadExploration?: boolean;
+  independentWork?: boolean;
   ambiguous?: boolean;
   durablePlanningUseful?: boolean;
   sddRequested?: boolean;
@@ -22,10 +24,6 @@ export interface ImplementationRouteDecision {
   next: string;
 }
 
-function validCount(value: number | undefined): number | undefined {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
-}
-
 /**
  * Pick the smallest useful implementation route from explicit scope facts.
  * The result is guidance for the orchestrator; it never launches an agent or
@@ -34,9 +32,6 @@ function validCount(value: number | undefined): number | undefined {
 export function chooseImplementationRoute(
   facts: ImplementationRouteFacts,
 ): ImplementationRouteDecision {
-  const filesToUnderstand = validCount(facts.filesToUnderstand);
-  const filesToImplement = validCount(facts.filesToImplement);
-
   if (facts.sddRequested) {
     return {
       route: "sdd",
@@ -48,30 +43,24 @@ export function chooseImplementationRoute(
     };
   }
 
-  if (facts.ambiguous || facts.durablePlanningUseful) {
+  if (facts.durablePlanningUseful) {
     return {
       route: "sdd",
       action: "propose",
       confidence: "medium",
       requiresUserDecision: true,
-      reason:
-        facts.ambiguous && facts.durablePlanningUseful
-          ? "The work is ambiguous and durable planning would reduce uncertainty."
-          : facts.ambiguous
-            ? "The work has substantial unresolved ambiguity."
-            : "Durable planning artifacts would materially reduce uncertainty.",
+      reason: facts.ambiguous
+        ? "Durable planning artifacts would reduce uncertainty in the ambiguous work."
+        : "Durable planning artifacts would materially reduce uncertainty.",
       next: "Offer SDD; do not create SDD artifacts until the user accepts it.",
     };
   }
 
-  const broadUnderstanding = filesToUnderstand !== undefined && filesToUnderstand >= 4;
-  const broadImplementation = filesToImplement !== undefined && filesToImplement >= 2;
-  if (facts.needsResearch || broadUnderstanding || broadImplementation || !facts.alreadyUnderstood) {
+  if (facts.broadExploration || facts.needsResearch || facts.independentWork) {
     const reasons: string[] = [];
-    if (facts.needsResearch) reasons.push("research is needed");
-    if (broadUnderstanding) reasons.push("understanding spans four or more files");
-    if (broadImplementation) reasons.push("implementation spans two or more non-trivial files");
-    if (!facts.alreadyUnderstood && reasons.length === 0) reasons.push("the work is not yet understood");
+    if (facts.broadExploration) reasons.push("genuinely broad exploration is needed");
+    if (facts.needsResearch) reasons.push("broad multi-source research is needed");
+    if (facts.independentWork) reasons.push("independent work justifies a separate context");
 
     return {
       route: "delegated",
@@ -79,18 +68,31 @@ export function chooseImplementationRoute(
       confidence: reasons.length > 1 ? "high" : "medium",
       requiresUserDecision: false,
       reason: `Use a narrow delegated action because ${reasons.join("; ")}.`,
-      next: "Delegate read-only exploration or one writer, then inspect and integrate the result.",
+      next: "Delegate the independent investigation or work item, then inspect and integrate the result.",
+    };
+  }
+
+  if (facts.ambiguous) {
+    return {
+      route: "direct",
+      action: "select",
+      confidence: "medium",
+      requiresUserDecision: false,
+      reason: "The ambiguity is bounded and does not by itself justify a separate workflow.",
+      next: "Ask one focused question to resolve the material ambiguity, then continue in the current session.",
     };
   }
 
   return {
     route: "direct",
     action: "select",
-    confidence: "high",
+    confidence: facts.alreadyUnderstood ? "high" : "medium",
     requiresUserDecision: false,
     reason: facts.mechanical
-      ? "The already-understood change is mechanical and bounded."
-      : "The already-understood change can be decided and verified within a small scope.",
+      ? "The change is mechanical and can be handled directly even when it spans several files."
+      : facts.alreadyUnderstood
+        ? "The bounded change can be decided and verified in the current session."
+        : "The unfamiliar work is bounded enough for focused inspection in the current session.",
     next: "Keep the action in the current session and run the applicable verification.",
   };
 }

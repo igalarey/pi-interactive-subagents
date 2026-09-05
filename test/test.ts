@@ -1083,46 +1083,52 @@ describe("status.ts", () => {
 });
 
 describe("implementation routing", () => {
-  it("keeps a bounded, already-understood change direct", () => {
+  it("keeps small unfamiliar work direct", () => {
     const decision = chooseImplementationRoute({
-      alreadyUnderstood: true,
-      filesToUnderstand: 2,
+      alreadyUnderstood: false,
+      filesToUnderstand: 1,
       filesToImplement: 1,
-      mechanical: true,
     });
     assert.deepEqual(
       {
         route: decision.route,
         action: decision.action,
+        confidence: decision.confidence,
         requiresUserDecision: decision.requiresUserDecision,
       },
+      { route: "direct", action: "select", confidence: "medium", requiresUserDecision: false },
+    );
+    assert.match(decision.reason, /focused inspection/);
+  });
+
+  it("keeps mechanical work direct even across several files", () => {
+    const decision = chooseImplementationRoute({
+      alreadyUnderstood: true,
+      filesToUnderstand: 6,
+      filesToImplement: 5,
+      mechanical: true,
+    });
+    assert.equal(decision.route, "direct");
+    assert.match(decision.reason, /mechanical/);
+  });
+
+  it("keeps bounded ambiguity direct and asks one focused question", () => {
+    const decision = chooseImplementationRoute({
+      alreadyUnderstood: false,
+      ambiguous: true,
+    });
+    assert.deepEqual(
+      { route: decision.route, action: decision.action, requiresUserDecision: decision.requiresUserDecision },
       { route: "direct", action: "select", requiresUserDecision: false },
     );
+    assert.match(decision.next, /Ask one focused question/);
   });
 
-  it("delegates broad understanding, research, or multi-file implementation", () => {
-    assert.equal(
-      chooseImplementationRoute({ alreadyUnderstood: true, filesToUnderstand: 4 }).route,
-      "delegated",
-    );
-    assert.equal(
-      chooseImplementationRoute({ alreadyUnderstood: true, needsResearch: true }).route,
-      "delegated",
-    );
-    assert.equal(
-      chooseImplementationRoute({ alreadyUnderstood: true, filesToImplement: 2 }).route,
-      "delegated",
-    );
-    assert.equal(
-      chooseImplementationRoute({ alreadyUnderstood: false, filesToUnderstand: 1 }).route,
-      "delegated",
-    );
-  });
-
-  it("proposes SDD for ambiguity but only selects it when explicitly requested", () => {
+  it("proposes durable planning and only selects SDD when requested", () => {
     const proposal = chooseImplementationRoute({
       alreadyUnderstood: false,
       ambiguous: true,
+      durablePlanningUseful: true,
     });
     assert.deepEqual(
       { route: proposal.route, action: proposal.action, requiresUserDecision: proposal.requiresUserDecision },
@@ -1131,13 +1137,32 @@ describe("implementation routing", () => {
 
     const selected = chooseImplementationRoute({
       alreadyUnderstood: false,
-      ambiguous: true,
       sddRequested: true,
     });
     assert.deepEqual(
       { route: selected.route, action: selected.action, requiresUserDecision: selected.requiresUserDecision },
       { route: "sdd", action: "select", requiresUserDecision: false },
     );
+  });
+
+  it("delegates broad exploration or multi-source research", () => {
+    assert.equal(
+      chooseImplementationRoute({ alreadyUnderstood: true, broadExploration: true }).route,
+      "delegated",
+    );
+    const research = chooseImplementationRoute({ alreadyUnderstood: true, needsResearch: true });
+    assert.equal(research.route, "delegated");
+    assert.match(research.reason, /multi-source research/);
+  });
+
+  it("delegates independent work that justifies separate context", () => {
+    const decision = chooseImplementationRoute({
+      alreadyUnderstood: true,
+      filesToImplement: 1,
+      independentWork: true,
+    });
+    assert.equal(decision.route, "delegated");
+    assert.match(decision.reason, /separate context/);
   });
 
   it("formats route decisions without implying that work was performed", () => {
@@ -2068,9 +2093,11 @@ describe("tool registration", () => {
       [
         "alreadyUnderstood",
         "ambiguous",
+        "broadExploration",
         "durablePlanningUseful",
         "filesToImplement",
         "filesToUnderstand",
+        "independentWork",
         "mechanical",
         "needsResearch",
         "sddRequested",
@@ -2078,15 +2105,21 @@ describe("tool registration", () => {
       ].sort(),
     );
     assert.deepEqual(routeTool.parameters.required, ["task", "alreadyUnderstood"]);
+    assert.match(routeTool.parameters.properties.filesToUnderstand.description, /does not select delegation/);
+    assert.match(routeTool.parameters.properties.filesToImplement.description, /does not select delegation/);
 
     const result = await routeTool.execute("call-1", {
       task: "bound the change",
       alreadyUnderstood: true,
       filesToUnderstand: 1,
       filesToImplement: 1,
+      broadExploration: false,
+      independentWork: false,
     });
     assert.equal(result.details.route, "direct");
     assert.equal(result.details.action, "select");
+    assert.equal(result.details.facts.broadExploration, false);
+    assert.equal(result.details.facts.independentWork, false);
     assert.match(result.content[0].text, /Route: direct/);
   });
 

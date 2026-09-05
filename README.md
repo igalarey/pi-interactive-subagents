@@ -33,9 +33,9 @@ There is also a `/subagent <agent> <task>` command for spawning directly.
 
 Use `implementation_route` when the smallest safe route is not obvious. It is advisory only: it does not inspect the repository, launch a child, edit files, or create SDD artifacts.
 
-- **direct** — the change is already understood and bounded (normally one to three files, or one mechanical file).
-- **delegated** — read-only exploration/research is broad, or implementation spans two or more non-trivial files; delegate a narrow action and integrate its result.
-- **sdd** — the user explicitly requested SDD, or ambiguity/durable planning justifies proposing it. A proposal requires explicit user acceptance.
+- **direct** — the work is bounded enough for focused inspection and implementation in the current session. Unfamiliarity, file counts, and bounded ambiguity do not by themselves trigger delegation; ask one focused question when needed.
+- **delegated** — exploration is genuinely broad, research spans multiple sources, or an independent work item benefits from separate context. Delegate a narrow action and integrate its result.
+- **sdd** — the user explicitly requested SDD, or durable planning artifacts would materially reduce uncertainty. A proposal requires explicit user acceptance.
 
 The tool requires the orchestrator to provide scope facts instead of pretending that the router can infer them:
 
@@ -46,8 +46,12 @@ implementation_route({
   filesToUnderstand: 1,
   filesToImplement: 1,
   mechanical: false,
+  broadExploration: false,
+  independentWork: false,
 });
 ```
+
+`alreadyUnderstood`, `filesToUnderstand`, and `filesToImplement` remain available as informational facts for existing consumers. Delegation is selected only from the explicit `broadExploration`, broad `needsResearch`, or `independentWork` signals.
 
 `subagents_list` reports each profile's runtime, effective tool allowlist, skills, nested spawn targets, and missing extension diagnostics. Restricted launches validate extension-backed tools before creating a child surface or session; a missing capability fails closed.
 
