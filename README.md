@@ -2,11 +2,11 @@
 
 Async subagents for [pi](https://github.com/badlogic/pi-mono). Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-When pi runs inside tmux, each sub-agent gets a visible pane. In any other terminal, the extension automatically uses a headless background process controlled through pi's RPC protocol. The widget, messaging, sandbox, session resume, and automatic result delivery work in both modes.
+Each sub-agent runs in an isolated background process controlled through Pi's RPC protocol. The parent terminal stays responsive while the widget, messaging, sandbox, session resume, and automatic result delivery continue in the main session.
 
 ## How it works
 
-`subagent()` returns immediately. Inside tmux, the sub-agent runs in a right split off the parent pi pane without stealing keyboard focus. Elsewhere it runs as a background process with output captured beside its launch script. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The child runs in the background, with output captured beside its launch script. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,24 +17,39 @@ When pi runs inside tmux, each sub-agent gets a visible pane. In any other termi
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-tmux panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
-
-If tmux shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
-
-```bash
-export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
-```
-
 ## Tools
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a tmux pane or background process (async) |
+| `implementation_route` | Advisory direct/delegated/SDD route selection from explicit scope facts |
+| `subagent` | Spawn a sub-agent in an isolated background process (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
-| `subagents_list` | List available agent definitions |
+| `subagents_list` | List available agent definitions and their effective capabilities |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
 There is also a `/subagent <agent> <task>` command for spawning directly.
+
+### Implementation routing
+
+Use `implementation_route` when the smallest safe route is not obvious. It is advisory only: it does not inspect the repository, launch a child, edit files, or create SDD artifacts.
+
+- **direct** — the change is already understood and bounded (normally one to three files, or one mechanical file).
+- **delegated** — read-only exploration/research is broad, or implementation spans two or more non-trivial files; delegate a narrow action and integrate its result.
+- **sdd** — the user explicitly requested SDD, or ambiguity/durable planning justifies proposing it. A proposal requires explicit user acceptance.
+
+The tool requires the orchestrator to provide scope facts instead of pretending that the router can infer them:
+
+```typescript
+implementation_route({
+  task: "Add the bounded parser test",
+  alreadyUnderstood: true,
+  filesToUnderstand: 1,
+  filesToImplement: 1,
+  mechanical: false,
+});
+```
+
+`subagents_list` reports each profile's runtime, effective tool allowlist, skills, nested spawn targets, and missing extension diagnostics. Restricted launches validate extension-backed tools before creating a child surface or session; a missing capability fails closed.
 
 ### Spawning
 
@@ -47,8 +62,9 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | --------- | ---- | ------- | ----------- |
 | `agent` | string | required | Which agent to spawn (must be known and permitted) |
 | `task` | string | required | Task prompt |
-| `name` | string | agent name | Display name for the pane (when present) and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
-| `model` | string | agent's model | Override the model for this spawn |
+| `name` | string | agent name | Display name for the process and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
+| `model` | string | agent's model | Override the model for this spawn. Worker requests for Astra are treated as reserved escalation. |
+| `useAstraXhigh` | boolean | `false` | Worker-only reserved escalation to Astra at `xhigh`; every activation asks the user and no-UI sessions are refused |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 
 ### Messaging
@@ -59,7 +75,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
-- **Running** — the message is typed into the live tmux pane or sent to the background process over RPC (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
+- **Running** — the message is sent to the background process over RPC (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
@@ -68,19 +84,23 @@ Every spawn records name → session file in `artifacts/<sessionId>/subagent-reg
 
 ### ask_question
 
-A sub-agent can ask its orchestrator a single freeform question when requirements are ambiguous or a decision materially affects the work. The session **stays open** (parked as `waiting`) instead of exiting; the parent is notified with the sub-agent's name, replies via `subagent_message({ name, message })`, and the reply arrives as the sub-agent's next turn. Parallel questions are supported — each waiting sub-agent has its own name.
+A sub-agent can ask its orchestrator one focused question only when a material ambiguity or blocker prevents safe progress, or a coordinator-only decision is required. Resolve local, reversible choices without asking for routine confirmation. The session **stays open** (parked as `waiting`) instead of exiting; the parent is notified with the sub-agent's name, replies via `subagent_message({ name, message })`, and the reply arrives as the sub-agent's next turn. Each sub-agent may have one pending question; a second one is rejected instead of replacing the first. Parallel questions are supported — each waiting sub-agent has its own name.
 
-If the reply arrives while the sub-agent is still mid-turn, it is absorbed into the current turn — either way the question is marked answered and the session exits normally when the work is done. If the parent never replies, the pane stays open until a human closes it. Only available inside sub-agent sessions.
+If the reply arrives while the sub-agent is still mid-turn, it is absorbed into the current turn — either way the question is marked answered and the session exits normally when the work is done. If the parent never replies, the background process stays open until it is terminated. Only available inside sub-agent sessions.
+
+### Structured handoffs
+
+Every launch asks the child to finish with a concise `## Handoff` footer containing `Status`, `Summary`, `Files`, `Verification`, `Risks/Blockers`, and `Next`. The parent receives the parsed footer in the result details when the child follows the format. An unstructured response is preserved as `unknown`; the extension never invents completion, file changes, or verification claims.
 
 ## Bundled agents
 
-| Agent | Model | Tools | Role |
-| ----- | ----- | ----- | ---- |
-| **scout** | `openai-codex/gpt-5.6-luna` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openai-codex/gpt-5.6-terra` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openai-codex/gpt-6-astra` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| Agent | Model | Thinking | Tools | Role |
+| ----- | ----- | -------- | ----- | ---- |
+| **scout** | `openai-codex/gpt-5.6-luna` | `max` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
+| **researcher** | `openai-codex/gpt-5.6-luna` | `max` | `read`, `safe_bash` | Web research through sandboxed HTTP/search commands, synthesized into a sourced brief |
+| **worker** | `openai-codex/gpt-5.6-sol` | `high` | `read`, `write`, `edit`, `bash` + spawning | General implementer; may spawn `scout` and `researcher` |
 
-All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). The top-level Pi session is configured separately with `openai-codex/gpt-6-astra` at `xhigh` thinking.
+All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). For reserved worker tasks, `useAstraXhigh: true` requests `openai-codex/gpt-6-astra` at `xhigh`; the extension always asks the user before activation, including on resume, and refuses when interactive confirmation is unavailable.
 
 ## Custom agents
 
@@ -92,7 +112,7 @@ name: my-agent
 description: Does something specific
 model: openai-codex/gpt-6-astra
 thinking: medium
-tools: read, edit, write, safe_bash, web_search
+tools: read, edit, write, safe_bash
 session-mode: lineage-only
 auto-exit: true
 ---
@@ -108,7 +128,7 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child; if a declared extension is unavailable, spawning fails with a diagnostic instead of silently granting an incomplete loadout |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -131,12 +151,12 @@ With `auto-exit: true`, the session shuts down when the agent's turn ends — th
 
 Notes:
 
-- **Manual input does not strand an auto-exit sub-agent.** If a human types into the pane, the session still closes once that turn completes normally — only an escape/abort leaves it open.
+- **Follow-up input does not strand an auto-exit sub-agent.** If the orchestrator sends another message, the session still closes once that turn completes normally; only an abort leaves it open.
 - **Auto-exit is suppressed while work is in flight:** the session parks as `waiting` instead of exiting when an `ask_question` is still unanswered, or when the agent's own child sub-agents are still running (a worker can stop after dispatching children and stays open until the last result returns).
 
 ### interactive
 
-Controls whether `stalled`/`recovered` status transitions send a steer message to the parent session. Defaults to the inverse of `auto-exit`: autonomous agents get stall pings; user-driven agents stay quiet (the user is already working in that pane — the widget still updates). Set explicitly to override.
+Controls whether `stalled`/`recovered` status transitions send a steer message to the parent session. Defaults to the inverse of `auto-exit`: autonomous agents get stall pings, while explicitly interactive profiles stay quiet and rely on the widget. Set explicitly to override.
 
 ## Tool access control
 
@@ -144,7 +164,7 @@ Access is **whitelist-only**. Every sub-agent process is launched with `--no-ext
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
-Extensions can register additional tools for sub-agents at runtime via `registerToolExtension(name, path)` on the `__pi_interactive_subagents` process global.
+Extensions can register additional tools for sub-agents at runtime via `registerToolExtension(name, path)` on the `__pi_interactive_subagents` process global. Restricted launches fail clearly when a declared extension-backed tool is unavailable; install or register the extension before using that profile rather than bypassing the whitelist.
 
 ## Role folders
 
@@ -177,25 +197,19 @@ Status display is configured via `config.json` in the extension directory (copy 
 
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono)
-- `bash` on `PATH` (included with Git for Windows and standard on macOS/Linux)
-- Optional: [tmux](https://github.com/tmux/tmux) for visible split panes
+- [Pi](https://github.com/badlogic/pi-mono)
+- A compatible Bash executable for generated launch scripts
 
-Run `pi` directly in any terminal to use the universal background fallback:
+On Windows, Git Bash is detected automatically and is the recommended option. Pi itself may be started from Orca's terminal, PowerShell, Command Prompt, Git Bash, or another terminal; the extension launches the child Bash executable independently. Other compatible Bash distributions can be used by setting `PI_SUBAGENT_BASH` to the full executable path.
 
-```bash
+```powershell
+$env:PI_SUBAGENT_BASH = "C:\Program Files\Git\bin\bash.exe"
 pi
-```
-
-For visible panes, start it inside tmux:
-
-```bash
-tmux new -A -s pi 'pi'
 ```
 
 ## Acknowledgements
 
-Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
+Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture and status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
 
 ## License
 

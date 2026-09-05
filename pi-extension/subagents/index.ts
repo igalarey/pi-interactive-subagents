@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -15,8 +15,6 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import {
-  isBackgroundSurface,
-  isTmuxAvailable,
   createSurface,
   sendCommand,
   sendLongCommand,
@@ -24,7 +22,7 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
-} from "./tmux.ts";
+} from "./surface.ts";
 
 import {
   countSessionEntryLines,
@@ -60,6 +58,16 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
+import {
+  chooseImplementationRoute,
+  formatImplementationRouteDecision,
+} from "./routing.ts";
+import {
+  createSubagentHandoff,
+  parseStructuredHandoff,
+  STRUCTURED_HANDOFF_INSTRUCTION,
+  type StructuredHandoff,
+} from "./handoff.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -101,17 +109,56 @@ const SubagentParams = Type.Object({
   name: Type.Optional(
     Type.String({
       description:
-        "Optional cosmetic label for the subagent's pane and widget row. Defaults to the agent name. " +
+        "Optional cosmetic label for the subagent process and widget row. Defaults to the agent name. " +
         "Has no effect on which agent runs — use `agent` for that.",
     }),
   ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  model: Type.Optional(
+    Type.String({
+      description:
+        "Optional model override. Worker requests for Astra are treated as reserved escalation and require user approval.",
+    }),
+  ),
+  useAstraXhigh: Type.Optional(
+    Type.Boolean({
+      description:
+        "Worker-only reserved escalation to openai-codex/gpt-6-astra at xhigh. The extension always asks the user before activating it.",
+    }),
+  ),
   cwd: Type.Optional(
     Type.String({
       description:
         "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
     }),
   ),
+});
+
+const ImplementationRouteParams = Type.Object({
+  task: Type.String({ description: "The outcome the user requested" }),
+  alreadyUnderstood: Type.Boolean({
+    description: "Whether the current session already understands the required change",
+  }),
+  filesToUnderstand: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      description: "Estimated files needed to understand the current action, not a risk score",
+    }),
+  ),
+  filesToImplement: Type.Optional(
+    Type.Integer({
+      minimum: 0,
+      description: "Estimated non-trivial files to change in the current action",
+    }),
+  ),
+  mechanical: Type.Optional(
+    Type.Boolean({ description: "Whether the already-understood change is mechanical" }),
+  ),
+  needsResearch: Type.Optional(Type.Boolean({ description: "Whether broad external research is needed" })),
+  ambiguous: Type.Optional(Type.Boolean({ description: "Whether substantial ambiguity remains" })),
+  durablePlanningUseful: Type.Optional(
+    Type.Boolean({ description: "Whether durable proposal/spec/design/task artifacts would reduce uncertainty" }),
+  ),
+  sddRequested: Type.Optional(Type.Boolean({ description: "Whether the user explicitly requested SDD" })),
 });
 
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
@@ -164,9 +211,80 @@ const SPAWNING_TOOLS = [
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
 
+/** Tool registered by this extension for lightweight route selection. */
+const ROUTING_TOOL = "implementation_route";
+
+const RESERVED_WORKER_MODEL = "openai-codex/gpt-6-astra";
+const RESERVED_WORKER_MODEL_ALIASES = new Set([
+  RESERVED_WORKER_MODEL,
+  "gpt-6-astra",
+]);
+
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+
+function isReservedWorkerModel(model: string | null | undefined): boolean {
+  const normalized = model?.trim().toLowerCase();
+  const baseModel = normalized?.split(":", 1)[0];
+  return baseModel ? RESERVED_WORKER_MODEL_ALIASES.has(baseModel) : false;
+}
+
+function requestsReservedWorkerEscalation(
+  params: { agent?: string; model?: string; useAstraXhigh?: boolean },
+  agentDefaults?: Pick<AgentDefaults, "model" | "thinking"> | null,
+): boolean {
+  const configuredAstraXhigh = !params.model &&
+    isReservedWorkerModel(agentDefaults?.model) &&
+    agentDefaults?.thinking?.trim().toLowerCase() === "xhigh";
+  return params.agent === "worker" &&
+    (params.useAstraXhigh === true || isReservedWorkerModel(params.model) || configuredAstraXhigh);
+}
+
+function isReservedWorkerLoadout(
+  loadout: Pick<SubagentLoadout, "agent" | "model" | "thinking">,
+): boolean {
+  return loadout.agent === "worker" &&
+    isReservedWorkerModel(loadout.model) &&
+    loadout.thinking?.trim().toLowerCase() === "xhigh";
+}
+
+async function confirmReservedWorkerEscalation(
+  ctx: Pick<ExtensionContext, "hasUI" | "ui"> | undefined,
+  task: string | undefined,
+): Promise<{ approved: true } | { approved: false; message: string }> {
+  if (!ctx?.hasUI || typeof ctx.ui?.confirm !== "function") {
+    return {
+      approved: false,
+      message:
+        "Cannot activate reserved Astra xhigh: explicit user confirmation requires an interactive UI. " +
+        "Use the default worker profile (Sol/high) instead.",
+    };
+  }
+
+  try {
+    const approved = await ctx.ui.confirm(
+      "Activate reserved Astra xhigh?",
+      [
+        `This worker will use ${RESERVED_WORKER_MODEL} with xhigh thinking.`,
+        "It is reserved for exceptional tasks and may use more time or budget.",
+        `Task: ${task?.trim() || "(no task provided)"}`,
+        "",
+        "Activate this profile for this launch?",
+      ].join("\n"),
+    );
+    return approved
+      ? { approved: true }
+      : { approved: false, message: "Canceled: reserved Astra xhigh was not activated." };
+  } catch {
+    return {
+      approved: false,
+      message:
+        "Cannot activate reserved Astra xhigh: the user confirmation dialog failed. " +
+        "Use the default worker profile (Sol/high) instead.",
+    };
+  }
 }
 
 // ── Runtime tool-extension registration ─────────────────────────────────────
@@ -185,6 +303,9 @@ export function registerToolExtension(name: string, extensionPath: string): void
   }
   if ((SPAWNING_TOOLS as readonly string[]).includes(name)) {
     throw new Error(`Cannot register custom tool "${name}": shadows a spawning tool`);
+  }
+  if (name === ROUTING_TOOL) {
+    throw new Error(`Cannot register custom tool "${name}": shadows the route selector`);
   }
   const existing = EXTRA_TOOL_EXTENSIONS.get(name);
   if (existing === extensionPath) return; // idempotent / reload-safe
@@ -211,8 +332,8 @@ export function registerToolExtension(name: string, extensionPath: string): void
  */
 function getToolExtensionPath(tool: string): string | undefined {
   if (BUILTIN_TOOLS.has(tool)) return undefined;
-  // The four spawning tools are registered by THIS extension.
-  if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
+  // The spawning tools and route selector are registered by THIS extension.
+  if ((SPAWNING_TOOLS as readonly string[]).includes(tool) || tool === ROUTING_TOOL) {
     return fileURLToPath(import.meta.url);
   }
   const extBase = join(getAgentConfigDir(), "extensions");
@@ -330,6 +451,11 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   return SUBAGENT_ALLOWLIST ? all.filter((a) => SUBAGENT_ALLOWLIST.has(a.name)) : all;
 }
 
+function resolveRequestedCwd(rawCwd: string | null, cwdBase: string): string | null {
+  if (!rawCwd) return null;
+  return isAbsolute(rawCwd) || win32.isAbsolute(rawCwd) ? rawCwd : join(cwdBase, rawCwd);
+}
+
 function resolveSubagentPaths(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
@@ -337,11 +463,7 @@ function resolveSubagentPaths(
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
   const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
-  const effectiveCwd = rawCwd
-    ? rawCwd.startsWith("/")
-      ? rawCwd
-      : join(cwdBase, rawCwd)
-    : null;
+  const effectiveCwd = resolveRequestedCwd(rawCwd, cwdBase);
   const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
   const effectiveAgentDir =
     localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
@@ -391,7 +513,7 @@ function resolveLaunchBehavior(
  *   2. Default: the inverse of `auto-exit`. Agents that auto-exit are
  *      autonomous (scout, researcher) and the parent session should be
  *      woken on stall/recovery transitions. Agents that don't auto-exit are
- *      driven by the user in their own pane (worker) and stall pings are noise.
+ *      treated as externally supervised and stall pings are noise.
  */
 function resolveEffectiveInteractive(
   _params: Static<typeof SubagentParams>,
@@ -491,19 +613,6 @@ function widgetIcon(kind: StatusSnapshot["kind"]): string {
 }
 
 /**
- * Wait long enough for a freshly created pane to finish shell startup.
- *
- * Some environments do extra shell-init work before the prompt is ready
- * (for example direnv/devenv), so the delay is configurable for users who hit
- * dropped commands. Keep the historical default at 500ms.
- */
-function getShellReadyDelayMs(): number {
-  const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
-  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
-}
-
-/**
  * Build the internal artifact directory path for the current session.
  * Used by the subagents extension to stash task files, system prompts, and
  * launch scripts for sub-agents. Path convention:
@@ -537,7 +646,7 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "handoff"
   >,
   name: string,
 ): string {
@@ -559,9 +668,15 @@ function resolveResultPresentation(
     );
   }
 
+  const handoffNotice = result.handoff
+    ? result.handoff.structured
+      ? `\n\nReported handoff status: ${result.handoff.status}. Inspect the reported files and verification before accepting it.`
+      : "\n\nNo structured handoff footer was detected; inspect and verify the raw summary yourself."
+    : "";
+
   return result.exitCode !== 0
-    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
-    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${handoffNotice}${sessionRef}`
+    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${handoffNotice}${sessionRef}`;
 }
 
 /**
@@ -582,6 +697,8 @@ interface SubagentResult {
   errorMessage?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
+  /** Machine-readable footer parsed from the agent's final response. */
+  handoff?: StructuredHandoff;
 }
 
 /**
@@ -606,12 +723,12 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  capabilities?: AgentCapabilitySummary;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
    * session via a steer message. The widget still updates locally. Used for
-   * long-running agents where the user drives the conversation in the
-   * subagent's pane (e.g. planner).
+   * long-running agents that are supervised through explicit messages.
    */
   interactive: boolean;
 }
@@ -774,6 +891,7 @@ function updateWidget() {
  * as standalone prompts in the child session.
  */
 const SUBAGENT_CONTROL_TOOLS = ["ask_question"] as const;
+const SUBAGENT_CONTROL_TOOL_SET = new Set<string>(SUBAGENT_CONTROL_TOOLS);
 
 /**
  * Build the child --tools allowlist.
@@ -807,6 +925,100 @@ function buildSubagentToolAllowlist(
   }
 
   return [...allow].join(",");
+}
+
+function getMissingToolExtensions(toolAllowlist: string): string[] {
+  const missing = new Set<string>();
+  for (const rawTool of toolAllowlist.split(",")) {
+    const tool = rawTool.trim();
+    // ask_question is loaded separately for every Pi child by the launch and
+    // resume paths, so it is not resolved through the custom-tool map.
+    if (!tool || BUILTIN_TOOLS.has(tool) || SUBAGENT_CONTROL_TOOL_SET.has(tool)) continue;
+    const extPath = getToolExtensionPath(tool);
+    if (!extPath || !existsSync(extPath)) missing.add(tool);
+  }
+  return [...missing];
+}
+
+interface ToolCapabilitySummary {
+  restricted: boolean;
+  tools: string[] | null;
+  extensionBackedTools: string[];
+  missingExtensions: string[];
+  extensionPaths: string[];
+}
+
+interface AgentCapabilitySummary extends ToolCapabilitySummary {
+  runtime: "pi" | "claude";
+  skills: string[];
+  spawnable: string[];
+}
+
+function resolveToolCapabilities(toolAllowlist: string | null): ToolCapabilitySummary {
+  if (!toolAllowlist) {
+    return {
+      restricted: false,
+      tools: null,
+      extensionBackedTools: [],
+      missingExtensions: [],
+      extensionPaths: [],
+    };
+  }
+
+  const tools = [...new Set(toolAllowlist.split(",").map((tool) => tool.trim()).filter(Boolean))];
+  const extensionBackedTools: string[] = [];
+  const extensionPaths = new Set<string>();
+  for (const tool of tools) {
+    if (BUILTIN_TOOLS.has(tool) || SUBAGENT_CONTROL_TOOL_SET.has(tool)) continue;
+    const extensionPath = getToolExtensionPath(tool);
+    if (extensionPath) {
+      extensionBackedTools.push(tool);
+      extensionPaths.add(extensionPath);
+    }
+  }
+
+  return {
+    restricted: true,
+    tools,
+    extensionBackedTools,
+    missingExtensions: getMissingToolExtensions(toolAllowlist),
+    extensionPaths: [...extensionPaths],
+  };
+}
+
+function resolveAgentCapabilities(agentDefs: AgentDefaults | null): AgentCapabilitySummary {
+  const runtime = agentDefs?.cli === "claude" ? "claude" : "pi";
+  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
+  const toolAllowlist = runtime === "pi"
+    ? buildSubagentToolAllowlist(agentDefs?.tools, { grantSpawning })
+    : null;
+  return {
+    ...resolveToolCapabilities(toolAllowlist),
+    runtime,
+    skills: parseCommaList(agentDefs?.skills) ?? [],
+    spawnable: agentDefs?.subagentAgents ?? [],
+  };
+}
+
+function capabilityDetails(capabilities: AgentCapabilitySummary | ToolCapabilitySummary) {
+  return {
+    restricted: capabilities.restricted,
+    tools: capabilities.tools,
+    extensionBackedTools: capabilities.extensionBackedTools,
+    missingExtensions: capabilities.missingExtensions,
+    ...("runtime" in capabilities ? { runtime: capabilities.runtime } : {}),
+    ...("skills" in capabilities ? { skills: capabilities.skills, spawnable: capabilities.spawnable } : {}),
+  };
+}
+
+function assertToolExtensionsAvailable(toolAllowlist: string | null): void {
+  const missingExtensions = resolveToolCapabilities(toolAllowlist).missingExtensions;
+  if (missingExtensions.length > 0) {
+    throw new Error(
+      `Cannot launch restricted subagent: no extension is available for tool(s): ${missingExtensions.join(", ")}. ` +
+        "Register or install the tool extension before spawning this agent.",
+    );
+  }
 }
 
 /**
@@ -849,15 +1061,12 @@ function applySandboxToParts(
   // extensions backing the whitelisted tools. A null allowlist means the spawn
   // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
   if (loadout.toolAllowlist) {
+    assertToolExtensionsAvailable(loadout.toolAllowlist);
     parts.push("--no-extensions");
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
 
-    const extPaths = new Set<string>();
-    for (const tool of loadout.toolAllowlist.split(",")) {
-      const extPath = getToolExtensionPath(tool);
-      if (extPath && existsSync(extPath)) extPaths.add(extPath);
-    }
-    for (const extPath of extPaths) {
+    const capabilities = resolveToolCapabilities(loadout.toolAllowlist);
+    for (const extPath of capabilities.extensionPaths) {
       parts.push("-e", shellEscape(extPath));
     }
   }
@@ -990,9 +1199,8 @@ function resolveRunningByName(name: string):
 }
 
 /**
- * Type a follow-up message into a running subagent's live pane. Newlines are
- * collapsed to spaces because each newline submits a turn in the child's TUI
- * editor; a multi-line message would otherwise fire as several partial turns.
+ * Send a follow-up message to a running subagent over RPC. Newlines are
+ * collapsed to keep the follow-up as one turn.
  */
 function steerSubagent(
   running: RunningSubagent,
@@ -1081,10 +1289,9 @@ function startStatusRefresh(pi: ExtensionAPI) {
       }
       running.statusState = nextState;
 
-      // Interactive subagents (long-running, user-driven) intentionally don't
-      // wake the parent session on stalled/recovered transitions — the user is
-      // working in the subagent's pane, and a steer message here would burn an
-      // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
+      // Explicitly interactive subagents intentionally do not wake the parent
+      // on stalled/recovered transitions; the widget still updates, avoiding an
+      // orchestrator turn for a no-op "still waiting" ping.
       if (transition && !running.interactive) {
         transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
       }
@@ -1111,15 +1318,14 @@ function startStatusRefresh(pi: ExtensionAPI) {
 
 // Resuming a finished session is always autonomous: the relaunched agent runs
 // its follow-up task to completion and the harness delivers the result as a
-// steer message (fire-and-forget). An interactive resume would park the pane
-// waiting for the user, contradicting that result-delivery model.
+// steer message (fire-and-forget). A resumed process must run autonomously
+// rather than waiting indefinitely for direct user input.
 function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolean } {
   return { autoExit: true, interactive: false };
 }
 
 export const __test__ = {
   borderLine,
-  getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -1147,6 +1353,17 @@ export const __test__ = {
   contextWindowFor,
   formatUsageSegments,
   widgetIcon,
+  isReservedWorkerModel,
+  requestsReservedWorkerEscalation,
+  isReservedWorkerLoadout,
+  resolveRequestedCwd,
+  chooseImplementationRoute,
+  formatImplementationRouteDecision,
+  resolveToolCapabilities,
+  resolveAgentCapabilities,
+  capabilityDetails,
+  createSubagentHandoff,
+  parseStructuredHandoff,
 };
 
 function startWidgetRefresh() {
@@ -1159,25 +1376,30 @@ function startWidgetRefresh() {
 }
 
 /**
- * Launch a subagent: creates the multiplexer pane, builds the command, and
- * sends it. Returns a RunningSubagent — does NOT poll.
- *
- * Call watchSubagent() on the returned object to observe completion.
+ * Launch a subagent in a background child process. Returns a RunningSubagent
+ * immediately; call watchSubagent() on it to observe completion.
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
-  options?: { surface?: string },
+  options?: { surface?: string; model?: string; thinking?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const effectiveModel = options?.model ?? params.model ?? agentDefs?.model;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const effectiveThinking = options?.thinking ?? agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
+  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
+  const capabilities = resolveAgentCapabilities(agentDefs);
+
+  // Validate before creating a session, surface, or sandbox artifacts. Claude
+  // launches do not use the Pi extension allowlist, so they are exempt.
+  if (agentDefs?.cli !== "claude") assertToolExtensionsAvailable(toolAllowlist);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -1200,14 +1422,8 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
+  // A surface is an isolated background process with RPC input and log output.
   const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated && isTmuxAvailable()) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
-  const background = isBackgroundSurface(surface);
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
@@ -1229,21 +1445,19 @@ async function launchSubagent(
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
   const modeHint = agentDefs?.autoExit
     ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
-    : background
-      ? "Complete your task. The orchestrator can interact with you through messages while your background session remains open."
-      : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
-  const summaryInstruction = agentDefs?.autoExit
+    : "Complete your task. The orchestrator can interact with you through messages while your background session remains open.";
+  const completionInstruction = agentDefs?.autoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
+  const summaryInstruction = `${completionInstruction}\n\n${STRUCTURED_HANDOFF_INSTRUCTION}`;
   // An agent with a non-empty subagent_agents list is granted the spawning
   // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
-  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
   const identity = agentDefs?.body ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
   const fullTask = inheritsConversationContext
-    ? params.task
+    ? `${params.task}\n\n${STRUCTURED_HANDOFF_INSTRUCTION}`
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   // ── Claude Code CLI path ──
   if (agentDefs?.cli === "claude") {
@@ -1270,7 +1484,7 @@ async function launchSubagent(
 
     // Always pass the task as the prompt — even for resumed sessions,
     // the caller's task is the follow-up instruction.
-    cmdParts.push(shellEscape(params.task));
+    cmdParts.push(shellEscape(`${params.task}\n\n${summaryInstruction}`));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
     const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
@@ -1303,6 +1517,7 @@ async function launchSubagent(
       launchScriptFile,
       cli: "claude",
       sentinelFile,
+      capabilities,
       interactive: effectiveInteractive,
       statusState: createStatusState({
         source: "claude",
@@ -1319,7 +1534,7 @@ async function launchSubagent(
   // Build pi command
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
-  if (background) parts.push("--mode", "rpc");
+  parts.push("--mode", "rpc");
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
@@ -1336,7 +1551,6 @@ async function launchSubagent(
   // spawning toolset), we disable global extension discovery and re-enable only
   // the extensions backing the whitelisted tools. Bare/fork spawns with no tool
   // restriction keep their full default toolset and all global extensions.
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
 
   // Snapshot the fully-resolved sandbox beside the session file so a later
   // `subagent_message({ name })` resume can replay the exact same
@@ -1382,14 +1596,9 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
-  // Pass task and skill prompts to the sub-agent.
-  // Only full-context fork mode gets a direct task argument because it already
-  // inherits the parent conversation. Blank-session modes use artifact-backed
-  // handoff so the wrapper instructions arrive as the initial user message.
-  let taskArg: string;
-  if (launchBehavior.taskDelivery === "direct") {
-    taskArg = fullTask;
-  } else {
+  // Persist blank-session context for diagnostics while sending the expanded
+  // task over RPC as the initial user message.
+  if (launchBehavior.taskDelivery !== "direct") {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const safeName = params.name
       .toLowerCase()
@@ -1401,20 +1610,14 @@ async function launchSubagent(
     const artifactPath = join(artifactDir, artifactName);
     mkdirSync(dirname(artifactPath), { recursive: true });
     writeFileSync(artifactPath, fullTask, "utf8");
-    taskArg = `@${artifactPath}`;
   }
 
   const promptArgs = buildPiPromptArgs({
     effectiveSkills,
     taskDelivery: launchBehavior.taskDelivery,
-    taskArg: background ? fullTask : taskArg,
+    taskArg: fullTask,
   });
-  const initialInput = background ? buildRpcInput(promptArgs) : undefined;
-  if (!background) {
-    for (const promptArg of promptArgs) {
-      parts.push(shellEscape(promptArg));
-    }
-  }
+  const initialInput = buildRpcInput(promptArgs);
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
@@ -1450,6 +1653,7 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    capabilities,
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1581,7 +1785,15 @@ async function watchSubagent(
       closeSurface(surface);
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return {
+        name,
+        task,
+        summary,
+        exitCode: result.exitCode,
+        elapsed,
+        handoff: createSubagentHandoff(summary, { exitCode: result.exitCode }),
+        ...(sessionId ? { claudeSessionId: sessionId } : {}),
+      };
     }
 
     // Pi subagent result extraction
@@ -1619,6 +1831,10 @@ async function watchSubagent(
       elapsed,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(stats ? { stats } : {}),
+      handoff: createSubagentHandoff(summary, {
+        exitCode: result.exitCode,
+        errorMessage: result.errorMessage,
+      }),
     };
   } catch (err: any) {
     try {
@@ -1635,6 +1851,10 @@ async function watchSubagent(
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
         sessionFile,
+        handoff: createSubagentHandoff("Subagent cancelled.", {
+          exitCode: 1,
+          errorMessage: "cancelled",
+        }),
       };
     }
     return {
@@ -1644,6 +1864,10 @@ async function watchSubagent(
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
+      handoff: createSubagentHandoff(`Subagent error: ${err?.message ?? String(err)}`, {
+        exitCode: 1,
+        errorMessage: err?.message ?? String(err),
+      }),
     };
   }
 }
@@ -1688,24 +1912,83 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // by which extensions are loaded into the child (default-deny --no-extensions
   // + explicit -e). See launchSubagent().
 
+  // ── implementation_route tool ──
+  pi.registerTool({
+    name: ROUTING_TOOL,
+    label: "Implementation Route",
+    description:
+      "Choose the smallest useful implementation route from explicit scope facts. " +
+      "Returns direct, delegated, or SDD guidance; it never launches an agent, edits files, or accepts a proposed SDD workflow. " +
+      "Use delegated for broad exploration/research or multi-file implementation, and propose SDD only when ambiguity or durable planning materially matters.",
+    promptSnippet:
+      "Select the smallest implementation route from explicit scope facts. " +
+      "This is advisory: it does not launch agents or edit files, and a proposed SDD route still needs explicit user acceptance.",
+    parameters: ImplementationRouteParams,
+
+    renderCall(args, theme) {
+      const task = typeof args.task === "string" ? args.task.trim() : "route task";
+      const preview = task.length > 80 ? `${task.slice(0, 80)}…` : task;
+      return new Text(theme.fg("toolTitle", theme.bold("route")) + theme.fg("dim", ` — ${preview}`), 0, 0);
+    },
+
+    renderResult(result, _opts, theme) {
+      const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+      return new Text(theme.fg("dim", text), 0, 0);
+    },
+
+    async execute(_toolCallId, params) {
+      const decision = chooseImplementationRoute({
+        alreadyUnderstood: params.alreadyUnderstood,
+        filesToUnderstand: params.filesToUnderstand,
+        filesToImplement: params.filesToImplement,
+        mechanical: params.mechanical,
+        needsResearch: params.needsResearch,
+        ambiguous: params.ambiguous,
+        durablePlanningUseful: params.durablePlanningUseful,
+        sddRequested: params.sddRequested,
+      });
+      return {
+        content: [{ type: "text", text: formatImplementationRouteDecision(params.task, decision) }],
+        details: {
+          task: params.task,
+          ...decision,
+          facts: {
+            alreadyUnderstood: params.alreadyUnderstood,
+            ...(params.filesToUnderstand !== undefined ? { filesToUnderstand: params.filesToUnderstand } : {}),
+            ...(params.filesToImplement !== undefined ? { filesToImplement: params.filesToImplement } : {}),
+            ...(params.mechanical !== undefined ? { mechanical: params.mechanical } : {}),
+            ...(params.needsResearch !== undefined ? { needsResearch: params.needsResearch } : {}),
+            ...(params.ambiguous !== undefined ? { ambiguous: params.ambiguous } : {}),
+            ...(params.durablePlanningUseful !== undefined ? { durablePlanningUseful: params.durablePlanningUseful } : {}),
+            ...(params.sddRequested !== undefined ? { sddRequested: params.sddRequested } : {}),
+          },
+        },
+      };
+    },
+  });
+
   // ── subagent tool ──
   pi.registerTool({
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent asynchronously. Uses a dedicated tmux pane when available, otherwise a universal background process. " +
+        "Spawn a sub-agent asynchronously in an isolated background process. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "The worker defaults to Sol/high. For an exceptional worker task, `useAstraXhigh` requests Astra/xhigh; the extension always asks the user before activation and refuses when no interactive UI is available. " +
+        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
+        "When the result arrives, inspect it and integrate the useful work before declaring the task complete.",
       promptSnippet:
-        "Spawn a sub-agent asynchronously in a tmux pane or universal background process. " +
+        "Spawn a sub-agent asynchronously in an isolated background process. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "The worker defaults to Sol/high. For an exceptional worker task, `useAstraXhigh` requests Astra/xhigh; the extension always asks the user before activation and refuses when no interactive UI is available. " +
+        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
+        "When the result arrives, inspect it and integrate the useful work before declaring the task complete.",
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1780,6 +2063,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        if (params.useAstraXhigh && params.agent !== "worker") {
+          const err = "`useAstraXhigh` is only available for the worker agent.";
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        const workerDefaults = params.agent === "worker" ? loadAgentDefaults(params.agent) : null;
+        let launchOptions: { model?: string; thinking?: string } | undefined;
+        if (requestsReservedWorkerEscalation(params, workerDefaults)) {
+          const confirmation = await confirmReservedWorkerEscalation(ctx, params.task);
+          if (!confirmation.approved) {
+            return {
+              content: [{ type: "text" as const, text: confirmation.message }],
+              details: { error: "reserved model not approved" },
+            };
+          }
+          launchOptions = { model: RESERVED_WORKER_MODEL, thinking: "xhigh" };
+        }
+
         // This spawner session's artifact dir hosts its persistent name
         // registry (artifacts/<parentSessionId>/subagent-registry.json).
         const parentArtifactDir = getArtifactDir(
@@ -1787,7 +2088,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ctx.sessionManager.getSessionId(),
         );
 
-        // Default the cosmetic pane label to the agent name when omitted,
+        // Default the cosmetic process label to the agent name when omitted,
         // disambiguating against running subagents, in-flight reservations, and
         // every name already in the registry — so names stay unique across the
         // whole session, running or finished. Reserve the chosen name
@@ -1800,12 +2101,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           reservedNames.add(reservedName);
         }
 
-        // Launch the subagent (creates pane, sends command). Release the name
+        // Launch the subagent process. Release the name
         // reservation once it registers in runningSubagents (or launch fails) —
         // from then on uniqueRunningName tracks it via the running map.
         let running;
         try {
-          running = await launchSubagent(params, ctx);
+          running = await launchSubagent(params, ctx, launchOptions);
         } finally {
           if (reservedName) reservedNames.delete(reservedName);
         }
@@ -1850,6 +2151,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(result.stats ? { stats: result.stats } : {}),
+                  ...(result.handoff ? { handoff: result.handoff } : {}),
+                  capabilities: capabilityDetails(running.capabilities ?? resolveAgentCapabilities(null)),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -1888,6 +2191,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             sessionFile: running.sessionFile,
             launchScriptFile: running.launchScriptFile,
             status: "started",
+            capabilities: capabilityDetails(running.capabilities ?? resolveAgentCapabilities(null)),
           },
         };
       },
@@ -1977,16 +2281,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        const lines = list.map((a) => {
+        const listedAgents = list.map((agent) => ({
+          ...agent,
+          capabilities: capabilityDetails(resolveAgentCapabilities(agent)),
+        }));
+        const lines = listedAgents.map((a) => {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";
           const model = a.model ? ` [${a.model}]` : "";
-          return `• ${a.name}${badge}${model}${desc}`;
+          const tools = a.capabilities.tools === null ? "default" : a.capabilities.tools.join(",") || "none";
+          const skills = a.capabilities.skills.length > 0 ? a.capabilities.skills.join(",") : "none";
+          const spawns = a.capabilities.spawnable.length > 0 ? a.capabilities.spawnable.join(",") : "none";
+          const missing = a.capabilities.missingExtensions.length > 0
+            ? `; missing extensions: ${a.capabilities.missingExtensions.join(",")}`
+            : "";
+          return `• ${a.name}${badge}${model}${desc}\n  capabilities: runtime=${a.capabilities.runtime}; tools=${tools}; skills=${skills}; spawns=${spawns}${missing}`;
         });
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
-          details: { agents: list },
+          details: { agents: listedAgents },
         };
       },
 
@@ -2016,15 +2330,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Send a message to a subagent by name. Names are unique within your session and persist after a subagent finishes, " +
         "so the SAME name works whether the subagent is running or finished: if it is still running, your message steers its live session; " +
         "if it has finished, your message resumes that session and continues it. " +
-        "`name` and `message` are both required. " +
+        "`name` and `message` are both required. Use it to answer a pending question or provide a concrete follow-up, not as a routine approval gate. " +
         "Steering a running subagent returns immediately with a local acknowledgement and does NOT, by itself, emit a new result. " +
         "Resuming is a fire-and-forget async call: when the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up. " +
         "DO NOT poll, sleep, tail logs, or read session files to detect completion — the harness handles delivery. " +
-        "DO NOT fabricate or assume results. After calling, either end your turn or work on other independent tasks.",
+        "DO NOT fabricate or assume results. After calling, either end your turn or work on other independent tasks; when the result arrives, inspect and integrate it.",
       promptSnippet:
         "Message a subagent by name: steers it if running, resumes it if finished (same name either way). " +
-        "`name` and `message` are required. Steering returns immediately; resuming delivers its result later as a steer message. " +
-        "Do not poll or fabricate results.",
+        "Use it for a pending question or concrete follow-up, not routine approval. `name` and `message` are required. " +
+        "Steering returns immediately; resuming delivers its result later as a steer message. Do not poll or fabricate results; inspect and integrate the delivered result.",
       parameters: Type.Object({
         name: Type.String({
           description:
@@ -2142,6 +2456,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
+        if (isReservedWorkerLoadout(loadout)) {
+          const confirmation = await confirmReservedWorkerEscalation(ctx, message);
+          if (!confirmation.approved) {
+            return {
+              content: [{ type: "text" as const, text: confirmation.message }],
+              details: { error: "reserved model not approved" },
+            };
+          }
+        }
+
         const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
 
         // Record entry count before resuming so we can extract new messages.
@@ -2150,14 +2474,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
         const surface = createSurface(name);
-        if (isTmuxAvailable()) {
-          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-        }
-        const background = isBackgroundSurface(surface);
 
         // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(sessionPath)];
-        if (background) parts.push("--mode", "rpc");
+        const parts = ["pi", "--session", shellEscape(sessionPath), "--mode", "rpc"];
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -2170,6 +2489,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Replay the model, identity, and default-deny tool/extension sandbox.
         applySandboxToParts(parts, loadout, { artifactDir, name });
+        const resumedCapabilities: AgentCapabilitySummary = {
+          ...resolveToolCapabilities(loadout.toolAllowlist),
+          runtime: "pi",
+          skills: [],
+          spawnable: loadout.spawnable ?? [],
+        };
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
@@ -2186,7 +2511,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, message, "utf8");
-          if (!background) parts.push(shellEscape(`@${resumeMsgFile}`));
         }
 
         // Build env prefix — replay the snapshot's config dir + spawn whitelist
@@ -2236,9 +2560,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `# Surface: ${surface}`,
             ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
           ].join("\n"),
-          initialInput: background && resumeMsgFile
-            ? buildRpcInput([message])
-            : undefined,
+          initialInput: resumeMsgFile ? buildRpcInput([message]) : undefined,
         });
 
         // Register as a running subagent for widget tracking
@@ -2251,6 +2573,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: sessionPath,
           launchScriptFile,
           activityFile,
+          capabilities: resumedCapabilities,
           interactive,
           statusState: createStatusState({
             source: "pi",
@@ -2294,6 +2617,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: sessionPath,
                   sessionId: resumedSessionId,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.handoff ? { handoff: createSubagentHandoff(summary, {
+                    exitCode: result.exitCode,
+                    errorMessage: result.errorMessage,
+                  }) } : {}),
+                  capabilities: capabilityDetails(resumedCapabilities),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -2321,6 +2649,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             sessionFile: sessionPath,
             launchScriptFile,
             status: "started",
+            capabilities: capabilityDetails(resumedCapabilities),
           },
         };
       },

@@ -5,7 +5,7 @@
  *
  * Subagents do NOT self-terminate via a tool. Auto-exit agents shut down
  * automatically when their agent loop ends (see the `agent_end` handler);
- * interactive agents end when the human exits the pane.
+ * non-auto-exit agents remain available for RPC follow-up messages until terminated.
  *
  * `ask_question` keeps the session OPEN: it writes a `${sessionFile}.ask`
  * signal the parent's watcher picks up, parks the session in a "waiting" state
@@ -333,18 +333,18 @@ export default function (pi: ExtensionAPI) {
     name: "ask_question",
     label: "ask_question",
     description:
-      "Ask the orchestrator (the parent agent that spawned you) a single question and pause until they reply. " +
-      "Use this when requirements are ambiguous, a decision would materially affect your work, you're blocked, " +
-      "or you need information or confirmation only the orchestrator has. Prefer asking over guessing. " +
+      "Ask the orchestrator (the parent agent that spawned you) one focused question and pause until they reply. " +
+      "Use this only when a material ambiguity, blocker, or coordinator-only decision prevents safe progress. " +
+      "Resolve local, reversible implementation choices yourself; do not ask for routine confirmation. " +
       "Your session stays open while you wait — the answer arrives as your next message, then you continue. " +
-      "Ask exactly one question per call; make separate calls for unrelated questions.",
+      "Ask exactly one question per call; make separate calls for unrelated blocking questions.",
     promptSnippet:
-      "Use this tool to ask the orchestrator one clarifying, missing-requirement, preference, or decision question before continuing — instead of guessing.",
+      "Ask the orchestrator one focused question only when a material blocker or coordinator-only decision prevents safe progress; otherwise choose a reversible default and continue.",
     promptGuidelines: [
       "Ask exactly one question per tool call.",
-      "If you need answers to multiple things, make separate ask_question calls instead of bundling them.",
-      "Prefer this tool over guessing when requirements, preferences, or implementation choices are unclear.",
-      "Use it when multiple valid paths exist and the right one depends on the orchestrator's intent.",
+      "If you need answers to multiple blocking things, make separate ask_question calls instead of bundling them.",
+      "Resolve ordinary implementation choices and other recoverable uncertainty without asking.",
+      "Use it when requirements are materially ambiguous, work is blocked, or only the orchestrator can decide.",
       "Give enough context in the question that the orchestrator can answer without re-reading your whole task.",
       "After asking, stop and wait — the reply will arrive as your next message.",
     ],
@@ -363,17 +363,33 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      // Keep the session open: suppress auto-exit for this turn and park in the
-      // "waiting" phase. The parent's watcher picks up the `.ask` signal and
-      // notifies the orchestrator, who replies via subagent_message.
-      awaitingAnswer = true;
-      recorder.askQuestion();
       const askData = {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         agent: process.env.PI_SUBAGENT_AGENT ?? "",
         question: params.question,
       };
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
+      // Set this before publishing the sidecar so a fast parent watcher cannot
+      // observe the question before auto-exit is suppressed for this turn.
+      const wasAwaitingAnswer = awaitingAnswer;
+      awaitingAnswer = true;
+      try {
+        // Exclusive creation prevents a second unanswered question from
+        // replacing the first one while the parent is deciding how to reply.
+        writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData), { encoding: "utf8", flag: "wx" });
+      } catch (error: any) {
+        awaitingAnswer = wasAwaitingAnswer;
+        if (error?.code === "EEXIST") {
+          throw new Error(
+            "This subagent already has a pending question; wait for the orchestrator's reply before asking another.",
+          );
+        }
+        throw error;
+      }
+
+      // Keep the session open: park in the "waiting" phase. The parent's
+      // watcher picks up the `.ask` signal and notifies the orchestrator, who
+      // replies via subagent_message.
+      recorder.askQuestion();
 
       return {
         content: [

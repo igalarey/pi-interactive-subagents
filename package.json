@@ -1,7 +1,7 @@
 {
   "name": "pi-interactive-subagents",
   "version": "3.7.2",
-  "description": "Async subagents for pi in tmux panes or universal background processes",
+  "description": "Async process-backed subagents for pi",
   "keywords": [
     "pi-package"
   ],

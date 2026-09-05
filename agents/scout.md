@@ -3,7 +3,7 @@ name: scout
 description: Fast codebase recon — explores files, finds patterns, maps architecture
 tools: read, grep, find, ls
 model: openai-codex/gpt-5.6-luna
-thinking: low
+thinking: max
 system-prompt: append
 auto-exit: true
 ---
@@ -38,3 +38,20 @@ Brief explanation of how the pieces connect.
 
 ## Start Here
 Which file to look at first and why.
+
+Then append this handoff footer:
+
+## Handoff
+Status: complete | blocked | needs-decision
+Summary:
+- The most useful finding.
+Files:
+- Files inspected, or None.
+Verification:
+- Read-only inspection performed; no tests/builds run.
+Risks/Blockers:
+- Remaining uncertainty, or None.
+Next:
+- The next concrete action, or None.
+
+Do not claim a file change or verification that you did not observe.

@@ -1,14 +1,9 @@
 /**
- * Integration test harness for pi-interactive-subagents.
+ * Integration test harness for process-backed subagents.
  *
- * Provides utilities to:
- * - Detect whether tmux is available
- * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in tmux panes
- * - Poll for file creation and screen output
- * - Clean up panes and temp files after tests
+ * Provides isolated agent definitions, background Pi sessions, output/file
+ * polling, and automatic process/temp-file cleanup.
  */
-import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
@@ -23,21 +18,17 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
-  isMuxAvailable,
   createSurface,
-  createSurfaceSplit,
   sendCommand,
   sendLongCommand,
   readScreen,
   readScreenAsync,
   closeSurface,
   shellEscape,
-} from "../../pi-extension/subagents/tmux.ts";
+} from "../../pi-extension/subagents/surface.ts";
 
-// Re-export tmux primitives for tests
 export {
   createSurface,
-  createSurfaceSplit,
   sendCommand,
   sendLongCommand,
   readScreen,
@@ -73,54 +64,12 @@ export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
-// ── Backend detection ──
-
-/**
- * Detect whether tmux is available in the current environment.
- * Returns ["tmux"] or [].
- */
-export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["tmux"] : [];
-}
-
-export function focusSurface(surface: string): void {
-  execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
-}
-
-export function getFocusedSurface(): string | null {
-  try {
-    const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
-      encoding: "utf8",
-    });
-    const activeLine = panes.split("\n").find((line) => line.endsWith(" 1"));
-    return activeLine?.split(" ")[0] ?? null;
-  } catch {
-    return null;
-  }
-}
-
-export async function waitForFocusedSurface(
-  surface: string,
-  timeout: number = PI_TIMEOUT,
-): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    if (getFocusedSurface() === surface) return;
-    await sleep(200);
-  }
-
-  throw new Error(
-    `Timeout (${timeout}ms) waiting for focused tmux pane ${surface}; ` +
-      `current focus is ${getFocusedSurface() ?? "unknown"}`,
-  );
-}
-
 // ── Test environment ──
 
 export interface TestEnv {
   /** Temp directory serving as the test project root */
   dir: string;
-  /** Panes created during the test (cleaned up automatically) */
+  /** Child-process surfaces created during the test */
   surfaces: string[];
   /** Temp files to clean up */
   tempFiles: string[];
@@ -175,17 +124,6 @@ export function createTrackedSurface(env: TestEnv, name: string): string {
   return surface;
 }
 
-export function createTrackedSurfaceSplit(
-  env: TestEnv,
-  name: string,
-  direction: "left" | "right" | "up" | "down",
-  fromSurface?: string,
-): string {
-  const surface = createSurfaceSplit(name, direction, fromSurface);
-  env.surfaces.push(surface);
-  return surface;
-}
-
 /**
  * Remove a surface from tracking (after manual close).
  */
@@ -196,11 +134,8 @@ export function untrackSurface(env: TestEnv, surface: string): void {
 // ── Pi session management ──
 
 /**
- * Start a pi session in a mux surface with the subagents extension loaded.
- * Returns immediately — the pi process runs asynchronously in the surface.
- *
- * The command ends with a sentinel so we can detect when pi exits:
- *   `pi ...; echo '__TEST_DONE_'$?'__'`
+ * Start a Pi session in a background surface with the local extension loaded.
+ * Returns immediately and appends a sentinel when Pi exits.
  */
 export function startPi(
   surface: string,
