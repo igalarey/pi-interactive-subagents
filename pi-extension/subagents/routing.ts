@@ -23,7 +23,7 @@ export interface ImplementationRouteDecision {
 }
 
 function validCount(value: number | undefined): number | undefined {
-  return Number.isInteger(value) && value >= 0 ? value : undefined;
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
 /**

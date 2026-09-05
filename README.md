@@ -1,6 +1,6 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono). Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Async subagents for [Pi](https://github.com/earendil-works/pi). Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
 Each sub-agent runs in an isolated background process controlled through Pi's RPC protocol. The parent terminal stays responsive while the widget, messaging, sandbox, session resume, and automatic result delivery continue in the main session.
 
@@ -195,9 +195,23 @@ Status display is configured via `config.json` in the extension directory (copy 
 }
 ```
 
+## Compatibility and verification
+
+This package targets `@earendil-works/pi-coding-agent` and `pi-tui` 0.85.0 with `typebox` 1.3.7.
+
+```bash
+npm ci --ignore-scripts
+npm run typecheck
+npm test
+npm run test:integration
+npm run test:smoke
+```
+
+The integration command runs process-only coverage by default; live model tests remain opt-in. The smoke test loads every extension entry point through Pi's real extension loader and exercises `safe_bash` without invoking a model.
+
 ## Requirements
 
-- [Pi](https://github.com/badlogic/pi-mono)
+- [Pi 0.85.0](https://github.com/earendil-works/pi)
 - A compatible Bash executable for generated launch scripts
 
 On Windows, Git Bash is detected automatically and is the recommended option. Pi itself may be started from Orca's terminal, PowerShell, Command Prompt, Git Bash, or another terminal; the extension launches the child Bash executable independently. Other compatible Bash distributions can be used by setting `PI_SUBAGENT_BASH` to the full executable path.

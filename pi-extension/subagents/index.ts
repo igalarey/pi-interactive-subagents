@@ -1,7 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
-import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
+import { Type, type Static } from "typebox";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -1000,14 +1000,15 @@ function resolveAgentCapabilities(agentDefs: AgentDefaults | null): AgentCapabil
   };
 }
 
-function capabilityDetails(capabilities: AgentCapabilitySummary | ToolCapabilitySummary) {
+function capabilityDetails(capabilities: AgentCapabilitySummary) {
   return {
     restricted: capabilities.restricted,
     tools: capabilities.tools,
     extensionBackedTools: capabilities.extensionBackedTools,
     missingExtensions: capabilities.missingExtensions,
-    ...("runtime" in capabilities ? { runtime: capabilities.runtime } : {}),
-    ...("skills" in capabilities ? { skills: capabilities.skills, spawnable: capabilities.spawnable } : {}),
+    runtime: capabilities.runtime,
+    skills: capabilities.skills,
+    spawnable: capabilities.spawnable,
   };
 }
 
@@ -1122,7 +1123,7 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
     ? { ok: true }
     : { ok: false, reason: read.reason, error: read.error };
 
-  if (read.ok) {
+  if (read.ok === true) {
     running.activity = read.activity;
     running.statusState = observeStatus(running.statusState, {
       snapshot: "present",
@@ -1380,8 +1381,8 @@ function startWidgetRefresh() {
  * immediately; call watchSubagent() on it to observe completion.
  */
 async function launchSubagent(
-  params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  params: Static<typeof SubagentParams> & { name: string },
+  ctx: { sessionManager: { getSessionFile(): string | null | undefined; getSessionId(): string; getSessionDir(): string }; cwd: string },
   options?: { surface?: string; model?: string; thinking?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -1932,7 +1933,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
 
     renderResult(result, _opts, theme) {
-      const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+      const text = result.content.find((part) => part.type === "text")?.text ?? "";
       return new Text(theme.fg("dim", text), 0, 0);
     },
 
@@ -2072,7 +2073,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         let launchOptions: { model?: string; thinking?: string } | undefined;
         if (requestsReservedWorkerEscalation(params, workerDefaults)) {
           const confirmation = await confirmReservedWorkerEscalation(ctx, params.task);
-          if (!confirmation.approved) {
+          if (confirmation.approved === false) {
             return {
               content: [{ type: "text" as const, text: confirmation.message }],
               details: { error: "reserved model not approved" },
@@ -2106,7 +2107,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // from then on uniqueRunningName tracks it via the running map.
         let running;
         try {
-          running = await launchSubagent(params, ctx, launchOptions);
+          running = await launchSubagent({ ...params, name: params.name! }, ctx, launchOptions);
         } finally {
           if (reservedName) reservedNames.delete(reservedName);
         }
@@ -2252,7 +2253,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback (shouldn't happen)
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const text = result.content.find((part) => part.type === "text")?.text ?? "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
@@ -2385,7 +2386,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback / error
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const text = result.content.find((part) => part.type === "text")?.text ?? "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
@@ -2458,7 +2459,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         if (isReservedWorkerLoadout(loadout)) {
           const confirmation = await confirmReservedWorkerEscalation(ctx, message);
-          if (!confirmation.approved) {
+          if (confirmation.approved === false) {
             return {
               content: [{ type: "text" as const, text: confirmation.message }],
               details: { error: "reserved model not approved" },
@@ -2691,6 +2692,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!details) return undefined;
 
     return {
+      invalidate() {},
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
@@ -2804,6 +2806,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (lines.length === 0 && overflow === 0) return undefined;
 
     return {
+      invalidate() {},
       render(width: number): string[] {
         const lineWidth = Math.max(0, width - 6);
         const contentLines = [
@@ -2831,6 +2834,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!details) return undefined;
 
     return {
+      invalidate() {},
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
