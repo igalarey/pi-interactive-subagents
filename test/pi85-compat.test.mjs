@@ -37,7 +37,7 @@ test('Windows background launches select Git Bash over the system placeholder', 
 });
 
 test('absolute Windows subagent cwd is not joined to the parent cwd', () => {
-  const cwd = 'C:\\Users\\Imanol\\Archivos\\vscode\\agent-config';
+  const cwd = 'C:\\fixtures\\agent-config';
   assert.equal(subagentsTestApi.resolveRequestedCwd(cwd, 'C:\\other'), cwd);
 });
 
