@@ -56,6 +56,17 @@ export function chooseImplementationRoute(
     };
   }
 
+  if (facts.ambiguous) {
+    return {
+      route: "direct",
+      action: "select",
+      confidence: "medium",
+      requiresUserDecision: true,
+      reason: "The material ambiguity requires a user response but does not by itself justify a separate workflow.",
+      next: "Ask one focused question, wait for the answer (not SDD approval), then continue in the current session.",
+    };
+  }
+
   if (facts.broadExploration || facts.needsResearch || facts.independentWork) {
     const reasons: string[] = [];
     if (facts.broadExploration) reasons.push("genuinely broad exploration is needed");
@@ -69,17 +80,6 @@ export function chooseImplementationRoute(
       requiresUserDecision: false,
       reason: `Use a narrow delegated action because ${reasons.join("; ")}.`,
       next: "Delegate the independent investigation or work item, then inspect and integrate the result.",
-    };
-  }
-
-  if (facts.ambiguous) {
-    return {
-      route: "direct",
-      action: "select",
-      confidence: "medium",
-      requiresUserDecision: false,
-      reason: "The ambiguity is bounded and does not by itself justify a separate workflow.",
-      next: "Ask one focused question to resolve the material ambiguity, then continue in the current session.",
     };
   }
 

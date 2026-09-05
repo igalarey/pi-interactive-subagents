@@ -1112,16 +1112,25 @@ describe("implementation routing", () => {
     assert.match(decision.reason, /mechanical/);
   });
 
-  it("keeps bounded ambiguity direct and asks one focused question", () => {
+  it("keeps material ambiguity direct and requires one focused answer", () => {
     const decision = chooseImplementationRoute({
       alreadyUnderstood: false,
       ambiguous: true,
     });
     assert.deepEqual(
       { route: decision.route, action: decision.action, requiresUserDecision: decision.requiresUserDecision },
-      { route: "direct", action: "select", requiresUserDecision: false },
+      { route: "direct", action: "select", requiresUserDecision: true },
     );
-    assert.match(decision.next, /Ask one focused question/);
+    assert.match(decision.reason, /requires a user response/);
+    assert.match(decision.next, /not SDD approval/);
+
+    for (const combined of [
+      chooseImplementationRoute({ alreadyUnderstood: false, ambiguous: true, independentWork: true }),
+      chooseImplementationRoute({ alreadyUnderstood: false, ambiguous: true, needsResearch: true }),
+    ]) {
+      assert.equal(combined.route, "direct");
+      assert.equal(combined.requiresUserDecision, true);
+    }
   });
 
   it("proposes durable planning and only selects SDD when requested", () => {
