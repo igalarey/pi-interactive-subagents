@@ -35,10 +35,11 @@ import {
   createBackgroundSurface,
   pollForExit,
   readScreen,
+  resolveBackgroundBash,
   sendCommand,
   sendLongCommand,
   shellEscape,
-} from "../pi-extension/subagents/tmux.ts";
+} from "../pi-extension/subagents/surface.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -63,8 +64,16 @@ import {
   findLatestAssistantError,
   runningChildrenCount,
 } from "../pi-extension/subagents/subagent-done.ts";
+import {
+  chooseImplementationRoute,
+  formatImplementationRouteDecision,
+} from "../pi-extension/subagents/routing.ts";
+import {
+  createSubagentHandoff,
+  parseStructuredHandoff,
+} from "../pi-extension/subagents/handoff.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/surface.ts";
 
 // --- Helpers ---
 
@@ -1073,6 +1082,118 @@ describe("status.ts", () => {
   });
 });
 
+describe("implementation routing", () => {
+  it("keeps a bounded, already-understood change direct", () => {
+    const decision = chooseImplementationRoute({
+      alreadyUnderstood: true,
+      filesToUnderstand: 2,
+      filesToImplement: 1,
+      mechanical: true,
+    });
+    assert.deepEqual(
+      {
+        route: decision.route,
+        action: decision.action,
+        requiresUserDecision: decision.requiresUserDecision,
+      },
+      { route: "direct", action: "select", requiresUserDecision: false },
+    );
+  });
+
+  it("delegates broad understanding, research, or multi-file implementation", () => {
+    assert.equal(
+      chooseImplementationRoute({ alreadyUnderstood: true, filesToUnderstand: 4 }).route,
+      "delegated",
+    );
+    assert.equal(
+      chooseImplementationRoute({ alreadyUnderstood: true, needsResearch: true }).route,
+      "delegated",
+    );
+    assert.equal(
+      chooseImplementationRoute({ alreadyUnderstood: true, filesToImplement: 2 }).route,
+      "delegated",
+    );
+    assert.equal(
+      chooseImplementationRoute({ alreadyUnderstood: false, filesToUnderstand: 1 }).route,
+      "delegated",
+    );
+  });
+
+  it("proposes SDD for ambiguity but only selects it when explicitly requested", () => {
+    const proposal = chooseImplementationRoute({
+      alreadyUnderstood: false,
+      ambiguous: true,
+    });
+    assert.deepEqual(
+      { route: proposal.route, action: proposal.action, requiresUserDecision: proposal.requiresUserDecision },
+      { route: "sdd", action: "propose", requiresUserDecision: true },
+    );
+
+    const selected = chooseImplementationRoute({
+      alreadyUnderstood: false,
+      ambiguous: true,
+      sddRequested: true,
+    });
+    assert.deepEqual(
+      { route: selected.route, action: selected.action, requiresUserDecision: selected.requiresUserDecision },
+      { route: "sdd", action: "select", requiresUserDecision: false },
+    );
+  });
+
+  it("formats route decisions without implying that work was performed", () => {
+    const text = formatImplementationRouteDecision(
+      "Add a bounded test",
+      chooseImplementationRoute({ alreadyUnderstood: true, filesToUnderstand: 1 }),
+    );
+    assert.match(text, /Implementation route for: Add a bounded test/);
+    assert.match(text, /Route: direct/);
+    assert.match(text, /Next:/);
+  });
+});
+
+describe("structured subagent handoffs", () => {
+  it("parses the stable Markdown footer into machine-readable fields", () => {
+    const handoff = parseStructuredHandoff(`
+## Handoff
+Status: complete
+Summary:
+- Implemented the change.
+Files:
+- pi-extension/subagents/index.ts
+- test/test.ts
+Verification:
+- npm test
+Risks/Blockers:
+- None
+Next:
+- Review the diff
+`);
+
+    assert.equal(handoff.structured, true);
+    assert.equal(handoff.status, "complete");
+    assert.equal(handoff.summary, "Implemented the change.");
+    assert.deepEqual(handoff.files, ["pi-extension/subagents/index.ts", "test/test.ts"]);
+    assert.deepEqual(handoff.verification, ["npm test"]);
+    assert.deepEqual(handoff.risks, ["None"]);
+    assert.deepEqual(handoff.next, ["Review the diff"]);
+  });
+
+  it("preserves an unstructured summary and does not invent completion", () => {
+    const handoff = createSubagentHandoff("I looked around but did not run tests.");
+    assert.equal(handoff.structured, false);
+    assert.equal(handoff.status, "unknown");
+    assert.equal(handoff.summary, "I looked around but did not run tests.");
+  });
+
+  it("marks a failed process as failed even if its footer claims completion", () => {
+    const handoff = createSubagentHandoff("## Handoff\nStatus: complete\nSummary:\n- Done", {
+      exitCode: 1,
+    });
+    assert.equal(handoff.status, "failed");
+    assert.equal(handoff.structured, true);
+  });
+});
+
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
@@ -1180,10 +1301,18 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/researcher/worker all resolve as non-interactive (auto-exit)", () => {
-    for (const name of ["scout", "researcher", "worker"]) {
+  it("bundled profiles use the requested models and thinking levels", () => {
+    const expected = {
+      scout: { model: "openai-codex/gpt-5.6-luna", thinking: "max" },
+      researcher: { model: "openai-codex/gpt-5.6-luna", thinking: "max" },
+      worker: { model: "openai-codex/gpt-5.6-sol", thinking: "high" },
+    };
+
+    for (const [name, profile] of Object.entries(expected)) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+      assert.equal(defs.model, profile.model);
+      assert.equal(defs.thinking, profile.thinking);
       assert.equal(
         testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
         false,
@@ -1204,6 +1333,13 @@ describe("subagent discovery", () => {
       assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
     }
     assert.ok(tools.has("bash"), "expected worker to keep bash");
+
+    const capabilities = testApi.resolveAgentCapabilities(worker);
+    assert.equal(capabilities.runtime, "pi");
+    assert.equal(capabilities.restricted, true);
+    assert.ok(capabilities.tools?.includes("subagent"));
+    assert.deepEqual(capabilities.spawnable, ["scout", "researcher"]);
+    assert.deepEqual(capabilities.missingExtensions, []);
   });
 
   it("scout and researcher are not granted spawning tools", () => {
@@ -1224,8 +1360,9 @@ describe("subagent discovery", () => {
       assert.equal(testApi.getToolExtensionPath("bash"), undefined);
       assert.equal(testApi.getToolExtensionPath("web_search"), webSearch);
       assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith(join("tools", "safe-bash.ts")));
-      // Spawning tools are registered by this extension itself.
+      // Spawning and routing tools are registered by this extension itself.
       assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+      assert.ok(testApi.getToolExtensionPath("implementation_route")?.endsWith("index.ts"));
     });
   });
 
@@ -1296,6 +1433,54 @@ describe("subagent discovery", () => {
   it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+  });
+
+  it("reports a missing extension for a restricted custom tool", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir }) => {
+      assert.throws(
+        () => testApi.applySandboxToParts(
+          [],
+          {
+            agent: "researcher",
+            toolAllowlist: "read,web_search,ask_question",
+            model: null,
+            thinking: null,
+            systemPromptMode: null,
+            identity: null,
+            spawnable: null,
+            autoExit: true,
+            cwd: null,
+            agentDir: null,
+          },
+          { artifactDir: join(projectDir, "artifacts"), name: "researcher" },
+        ),
+        /web_search.*extension/i,
+      );
+    });
+  });
+
+  it("does not require a separate extension for the ask_question control tool", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "worker",
+          toolAllowlist: "read,ask_question",
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: null,
+        },
+        { artifactDir: d, name: "worker" },
+      );
+      assert.ok(parts.includes("--no-extensions"), "expected --no-extensions");
+      assert.ok(!parts.some((part) => part.includes("subagent-done.ts")));
+    });
   });
 
   it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
@@ -1410,8 +1595,12 @@ describe("subagent discovery", () => {
       const result = await tool.execute();
       const agents = result.details?.agents ?? [];
 
-      assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
+      const visible = agents.find((agent: any) => agent.name === "visible-discovery-test-agent");
+      assert.ok(visible);
+      assert.equal(visible.capabilities.runtime, "pi");
+      assert.equal(visible.capabilities.restricted, false);
       assert.match(result.content[0].text, /visible-discovery-test-agent/);
+      assert.match(result.content[0].text, /capabilities: runtime=pi/);
     });
   });
 
@@ -1668,6 +1857,26 @@ describe("subagent-done.ts", () => {
       }
     });
 
+    it("rejects a second question while the first one is pending", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { mock, restore } = setupSubagentExtension(sessionFile);
+      try {
+        const tool = mock.registeredTools.find((t) => t.name === "ask_question");
+        const ctx = { shutdown() {} } as any;
+        await tool.execute("call-1", { question: "First question" }, undefined, undefined, ctx);
+
+        await assert.rejects(
+          () => tool.execute("call-2", { question: "Second question" }, undefined, undefined, ctx),
+          /already has a pending question/i,
+        );
+        assert.equal(JSON.parse(readFileSync(`${sessionFile}.ask`, "utf-8")).question, "First question");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     // Regression tests for the mid-run reply race: a reply steered in while the
     // asking run is still open fires `input` but NOT `agent_start`, so the flag
     // must be cleared on `input` or the session parks forever.
@@ -1765,7 +1974,7 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("tmux.ts interpretExitSidecar", () => {
+describe("surface.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
   it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
@@ -1848,6 +2057,39 @@ describe("tool registration", () => {
   });
 
 
+  it("registers the advisory implementation route tool", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const routeTool = registeredTools.find((tool) => tool.name === "implementation_route");
+    assert.ok(routeTool, "expected implementation_route to be registered");
+
+    assert.deepEqual(
+      Object.keys(routeTool.parameters.properties).sort(),
+      [
+        "alreadyUnderstood",
+        "ambiguous",
+        "durablePlanningUseful",
+        "filesToImplement",
+        "filesToUnderstand",
+        "mechanical",
+        "needsResearch",
+        "sddRequested",
+        "task",
+      ].sort(),
+    );
+    assert.deepEqual(routeTool.parameters.required, ["task", "alreadyUnderstood"]);
+
+    const result = await routeTool.execute("call-1", {
+      task: "bound the change",
+      alreadyUnderstood: true,
+      filesToUnderstand: 1,
+      filesToImplement: 1,
+    });
+    assert.equal(result.details.route, "direct");
+    assert.equal(result.details.action, "select");
+    assert.match(result.content[0].text, /Route: direct/);
+  });
+
   it("rejects a top-level spawn with no agent and no fork", async () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
@@ -1874,7 +2116,7 @@ describe("tool registration", () => {
     assert.match(result.content[0].text, /not a known agent/i);
   });
 
-  it("exposes a debloated schema: agent+task required, name/model/cwd optional, no override knobs", () => {
+  it("exposes a debloated schema with the explicit reserved-worker escalation", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -1884,8 +2126,8 @@ describe("tool registration", () => {
     const props = subagentTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["agent", "cwd", "model", "name", "task"],
-      "only agent/task/name/model/cwd should remain",
+      ["agent", "cwd", "model", "name", "task", "useAstraXhigh"],
+      "only agent/task/name/model/cwd/useAstraXhigh should remain",
     );
     assert.deepEqual(
       [...(subagentTool.parameters.required ?? [])].sort(),
@@ -1894,10 +2136,85 @@ describe("tool registration", () => {
     );
     // `name` is now optional and purely cosmetic.
     assert.match(props.name.description, /cosmetic/i);
+    assert.match(props.useAstraXhigh.description, /always asks the user/i);
     // The removed override knobs must be gone.
     for (const gone of ["tools", "skills", "systemPrompt", "fork", "interactive", "resumeSessionId"]) {
       assert.equal(props[gone], undefined, `expected ${gone} param to be removed`);
     }
+  });
+
+  it("requires user confirmation before reserved worker escalation", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    assert.ok(subagentTool, "expected subagent tool to be registered");
+
+    const sessionManager = {
+      getSessionFile: () => "/tmp/parent-session.jsonl",
+      getSessionDir: () => "/tmp",
+      getSessionId: () => "parent-session",
+    };
+    let confirmations = 0;
+    const result = await subagentTool.execute(
+      "call-1",
+      { agent: "worker", task: "reserved task", useAstraXhigh: true },
+      undefined,
+      undefined,
+      {
+        hasUI: true,
+        ui: {
+          confirm: async (title: string, message: string) => {
+            confirmations += 1;
+            assert.match(title, /Astra xhigh/i);
+            assert.match(message, /reserved task/);
+            return false;
+          },
+        },
+        sessionManager,
+      },
+    );
+
+    assert.equal(confirmations, 1);
+    assert.equal(result.details?.error, "reserved model not approved");
+    assert.match(result.content[0].text, /not activated/i);
+  });
+
+  it("refuses reserved worker escalation when no interactive UI is available", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    assert.ok(subagentTool, "expected subagent tool to be registered");
+
+    const result = await subagentTool.execute(
+      "call-1",
+      { agent: "worker", task: "reserved task", model: "gpt-6-astra" },
+      undefined,
+      undefined,
+      {
+        hasUI: false,
+        sessionManager: {
+          getSessionFile: () => "/tmp/parent-session.jsonl",
+          getSessionDir: () => "/tmp",
+          getSessionId: () => "parent-session",
+        },
+      },
+    );
+
+    assert.equal(result.details?.error, "reserved model not approved");
+    assert.match(result.content[0].text, /interactive UI/i);
+  });
+
+  it("recognizes the reserved Astra/xhigh loadout on resume", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(testApi.isReservedWorkerModel("openai-codex/gpt-6-astra:xhigh"), true);
+    assert.equal(
+      testApi.isReservedWorkerLoadout({ agent: "worker", model: "openai-codex/gpt-6-astra", thinking: "xhigh" }),
+      true,
+    );
+    assert.equal(
+      testApi.isReservedWorkerLoadout({ agent: "worker", model: "openai-codex/gpt-5.6-sol", thinking: "high" }),
+      false,
+    );
   });
 
   it("renders partial subagent tool-call args without throwing", () => {
@@ -2132,7 +2449,7 @@ describe("subagent interruption", () => {
       id: "a1",
       name: "Worker",
       task: "",
-      surface: "pane-1",
+      surface: "process-1",
       startTime: 0,
       sessionFile: "worker.jsonl",
       interactive: false,
@@ -2238,7 +2555,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("steers a running subagent by typing into its pane (newlines flattened)", () => {
+  it("steers a running subagent over RPC (newlines flattened)", () => {
     const testApi = (subagentsModule as any).__test__;
     let sentSurface = "";
     let sentText = "";
@@ -2250,7 +2567,7 @@ describe("subagent interruption", () => {
     });
 
     assert.deepEqual(result, { ok: true });
-    assert.equal(sentSurface, "pane-1");
+    assert.equal(sentSurface, "process-1");
     assert.equal(sentText, "do this then that");
   });
 
@@ -2259,7 +2576,7 @@ describe("subagent interruption", () => {
     const running = makeRunning();
 
     const result = testApi.steerSubagent(running, "hi", () => {
-      throw new Error("mux write failed");
+      throw new Error("transport write failed");
     });
 
     assert.match(result.error, /Failed to deliver message/);
@@ -2297,7 +2614,7 @@ describe("subagent interruption", () => {
         }),
       );
 
-      assert.equal(sentSurface, "pane-1");
+      assert.equal(sentSurface, "process-1");
       assert.equal(sentText, "keep going");
       assert.equal(result.content[0].text.includes('Message delivered to running subagent "Worker"'), true);
       assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "steered" });
@@ -2347,7 +2664,7 @@ describe("subagent interruption", () => {
 
       const result = withMockedNow(20_000, () =>
         testApi.handleSubagentSteer({ name: "Worker", message: "go" }, () => {
-          throw new Error("mux write failed");
+          throw new Error("transport write failed");
         }),
       );
 
@@ -2483,37 +2800,6 @@ describe("subagent status renderer", () => {
   });
 });
 
-describe("subagent startup delay", () => {
-  it("defaults to 500ms when no env var is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-
-  it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 2500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-});
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;
@@ -2677,6 +2963,49 @@ describe("subagent display helpers", () => {
 });
 
 describe("surface layer", () => {
+  describe("resolveBackgroundBash", () => {
+    it("prefers Git Bash over the Windows system placeholder", () => {
+      const gitBash = "C:\\Program Files\\Git\\bin\\bash.exe";
+      const systemBash = "C:\\Windows\\System32\\bash.exe";
+      const existing = new Set([gitBash, systemBash]);
+
+      assert.equal(
+        resolveBackgroundBash({
+          platform: "win32",
+          env: { ProgramFiles: "C:\\Program Files", SystemRoot: "C:\\Windows" },
+          exists: (path) => existing.has(path),
+          pathMatches: [systemBash],
+        }),
+        gitBash,
+      );
+    });
+
+    it("fails with an actionable message when no compatible Bash exists", () => {
+      const systemBash = "C:\\Windows\\System32\\bash.exe";
+      assert.throws(
+        () => resolveBackgroundBash({
+          platform: "win32",
+          env: { SystemRoot: "C:\\Windows" },
+          exists: (path) => path === systemBash,
+          pathMatches: [systemBash],
+        }),
+        /No compatible Bash executable found/,
+      );
+    });
+  });
+
+  it("keeps absolute Windows working directories unchanged", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const cwd = "C:\\Users\\Imanol\\Archivos\\vscode\\agent-config";
+    assert.equal(testApi.resolveRequestedCwd(cwd, "C:\\other"), cwd);
+  });
+
+  it("resolves relative working directories against the parent", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const base = join("root", "project");
+    assert.equal(testApi.resolveRequestedCwd("packages", base), join(base, "packages"));
+  });
+
   it("runs and steers a background process through JSONL stdin", async () => {
     const dir = createTestDir();
     const surface = createBackgroundSurface();
