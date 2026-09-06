@@ -2050,7 +2050,7 @@ describe("subagent-done.ts", () => {
       return { emit, ask, restore };
     }
 
-    it("exits (does not park) when the reply arrives mid-run via input", async () => {
+    it("exits at agent_settled when the reply arrives mid-run via input", async () => {
       const dir = createTestDir();
       const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
       try {
@@ -2059,15 +2059,18 @@ describe("subagent-done.ts", () => {
         // Reply arrives MID-RUN as a steer: input fires, no new agent_start.
         emit("input");
         let shutdown = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
-        assert.equal(shutdown, true, "reply consumed mid-run → agent_end should exit, not park");
+        const ctx = { shutdown() { shutdown = true; } };
+        emit("agent_end", { messages: [] }, ctx);
+        assert.equal(shutdown, false, "agent_end must leave room for automatic continuation");
+        emit("agent_settled", {}, ctx);
+        assert.equal(shutdown, true, "reply consumed mid-run → settled session should exit, not park");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
       }
     });
 
-    it("parks as waiting at agent_end while the reply is still pending (no input yet)", async () => {
+    it("parks as waiting at agent_settled while the reply is still pending (no input yet)", async () => {
       const dir = createTestDir();
       const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
       try {
@@ -2075,7 +2078,9 @@ describe("subagent-done.ts", () => {
         await ask();
         // No input yet — the orchestrator has not replied.
         let shutdown = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        const ctx = { shutdown() { shutdown = true; } };
+        emit("agent_end", { messages: [] }, ctx);
+        emit("agent_settled", {}, ctx);
         assert.equal(shutdown, false, "pending question with no reply must park, not exit");
       } finally {
         restore();
@@ -2090,14 +2095,69 @@ describe("subagent-done.ts", () => {
         emit("agent_start");
         await ask();
         let shutdown1 = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown1 = true; } });
+        const ctx1 = { shutdown() { shutdown1 = true; } };
+        emit("agent_end", { messages: [] }, ctx1);
+        emit("agent_settled", {}, ctx1);
         assert.equal(shutdown1, false, "parks while waiting");
         // Reply arrives as a fresh turn after the subagent had parked.
         emit("input");
         emit("agent_start");
         let shutdown2 = false;
-        emit("agent_end", { messages: [] }, { shutdown() { shutdown2 = true; } });
-        assert.equal(shutdown2, true, "after the reply turn, agent_end should exit");
+        const ctx2 = { shutdown() { shutdown2 = true; } };
+        emit("agent_end", { messages: [] }, ctx2);
+        emit("agent_settled", {}, ctx2);
+        assert.equal(shutdown2, true, "after the reply turn, the settled session should exit");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("discards a transient error when Pi retries successfully", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile);
+      try {
+        let shutdown = false;
+        const ctx = { shutdown() { shutdown = true; } };
+        emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "error", errorMessage: "WebSocket error" }],
+        }, ctx);
+        assert.equal(shutdown, false);
+        assert.equal(existsSync(`${sessionFile}.exit`), false);
+
+        emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "stop" }],
+        }, ctx);
+        emit("agent_settled", {}, ctx);
+        assert.equal(shutdown, true);
+        assert.equal(existsSync(`${sessionFile}.exit`), false, "stale retry errors must not reach the parent");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("publishes the final error only after Pi exhausts retries and settles", () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupCapturingExtension(sessionFile);
+      try {
+        let shutdown = false;
+        const ctx = { shutdown() { shutdown = true; } };
+        emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "error", errorMessage: "WebSocket error" }],
+        }, ctx);
+        assert.equal(shutdown, false);
+        assert.equal(existsSync(`${sessionFile}.exit`), false);
+
+        emit("agent_settled", {}, ctx);
+        assert.equal(shutdown, true);
+        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf-8")), {
+          type: "error",
+          errorMessage: "WebSocket error",
+          stopReason: "error",
+        });
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });

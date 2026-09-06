@@ -184,9 +184,11 @@ export default function (pi: ExtensionAPI) {
   // lands — on `input` (covers a reply steered into the current run) and on
   // `agent_start` (covers a reply that starts a fresh turn after parking).
   let awaitingAnswer = false;
+  let latestAgentMessages: any[] | undefined;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    latestAgentMessages = undefined;
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
@@ -202,7 +204,7 @@ export default function (pi: ExtensionAPI) {
     // here, not only on agent_start, because a reply steered in *mid-run* is
     // absorbed into the current run (pi's `steer` behavior injects it before
     // the next LLM call): no new agent_start fires, so without this the flag
-    // would stay set and agent_end would park the session as `waiting` even
+    // would stay set and agent_settled would park the session as `waiting` even
     // though the answer already arrived and was consumed. (The `input` event
     // fires for mid-run steers because prompt() emits it before queueing.)
     awaitingAnswer = false;
@@ -224,15 +226,15 @@ export default function (pi: ExtensionAPI) {
     recorder.agentStart();
   });
 
-  pi.on("agent_end", (event, ctx) => {
-    const messages = (event as any).messages as any[] | undefined;
-    // Never shut down while this session still has work in flight:
-    //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
-    //  - runningChildrenCount(): this subagent spawned its own children and is
-    //    waiting for their results (delivered as steered turns). Exiting now
-    //    would strand those children and drop their results.
-    // In both cases the session parks as `waiting` and resumes when the next
-    // turn lands.
+  pi.on("agent_end", (event) => {
+    latestAgentMessages = (event as any).messages as any[] | undefined;
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    // Pi emits agent_end before automatic retries, compaction recovery, and
+    // queued follow-ups. Publishing terminal state there lets the parent
+    // watcher kill the process before those continuations finish.
+    const messages = latestAgentMessages;
     const hasPendingChildren = runningChildrenCount() > 0;
     const shouldExit =
       !awaitingAnswer &&
@@ -241,11 +243,6 @@ export default function (pi: ExtensionAPI) {
       shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
       const errorInfo = findLatestAssistantError(messages);
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (errorInfo && sessionFile) {
@@ -272,7 +269,7 @@ export default function (pi: ExtensionAPI) {
     recorder.agentEndWaiting();
     if (autoExit) {
       // Reset any recorded manual input marker. Auto-exit is decided by whether
-      // the latest agent turn completed normally, not by who initiated it.
+      // the latest settled run completed normally, not by who initiated it.
       userTookOver = false;
     }
   });
