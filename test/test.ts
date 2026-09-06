@@ -1481,6 +1481,23 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("pins registered tool extensions ahead of legacy discovery without allowing conflicting registrations", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      const legacy = join(globalDir, "extensions", "web-fetch", "index.ts");
+      const registered = join(globalDir, "extensions", "packaged-web-fetch.ts");
+      mkdirSync(join(globalDir, "extensions", "web-fetch"), { recursive: true });
+      writeFileSync(legacy, "export default () => {};\n");
+      writeFileSync(registered, "export default () => {};\n");
+      assert.equal(testApi.getToolExtensionPath("web_fetch"), legacy);
+      subagentsModule.registerToolExtension("web_fetch", registered);
+      subagentsModule.registerToolExtension("web_fetch", registered);
+      assert.equal(testApi.getToolExtensionPath("web_fetch"), registered);
+      assert.deepEqual(testApi.resolveAgentCapabilities({ tools: "web_fetch" }).extensionPaths, [registered]);
+      assert.throws(() => subagentsModule.registerToolExtension("web_fetch", legacy), /already registered/);
+      assert.throws(() => subagentsModule.registerToolExtension("read", registered), /built-in/);
+    });
+  });
+
   it("ignores invalid session-mode values", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(

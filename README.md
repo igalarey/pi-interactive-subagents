@@ -248,9 +248,11 @@ The pilot defaults to a 60-second per-test deadline. Set `PI_TEST_TIMEOUT` betwe
 
 After the pilot is reviewed, the full seven-case suite can be enabled with `PI_RUN_LIVE_SUBAGENT_TESTS=1`, an explicit non-reserved `PI_TEST_MODEL`, and `npm run test:integration`. Keep `--test-concurrency=1`; the fixtures temporarily set process-wide cwd/config variables.
 
-Verified on native Windows with Pi 0.85.0 and `openai-codex/gpt-5.6-sol`: one-child pilot passed, then all seven cases passed in approximately 36.5 seconds. No terminal-host APIs were used; this does not certify Herdr, other operating systems, or the parent UI. Explicit config copies and test sessions were temporary. Offline coverage includes 176 unit cases, 14 local integration checks and 3 loader/compatibility checks.
+Verified on native Windows with Pi 0.85.0 and `openai-codex/gpt-5.6-sol`: one-child pilot passed, then all seven cases passed in approximately 36.5 seconds. No terminal-host APIs were used; this does not certify Herdr, other operating systems, or the parent UI. Explicit config copies and test sessions were temporary. Offline coverage includes 177 unit cases, 14 local integration checks and 3 loader/compatibility checks.
 
 The startup-failure case reproduced a launcher bug: printing the completion marker could hide a failed command behind the shell's final zero exit status. Launch and resume scripts now preserve the command status after printing that marker; a model-free subprocess regression covers exit codes 0, 7 and 127.
+
+Extensions may register their own backing file through `globalThis.__pi_interactive_subagents.registerToolExtension(name, path)`. An explicit registration takes precedence over legacy extension-directory discovery, so a packaged tool is not silently replaced by an older file when launching a restricted child. Re-registering the same path is idempotent; conflicting registrations are rejected, and a missing explicitly selected file blocks launch rather than falling back. Registration is not a sandbox for extension code.
 
 ## Requirements
 

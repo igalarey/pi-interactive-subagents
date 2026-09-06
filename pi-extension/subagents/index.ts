@@ -361,12 +361,10 @@ function getToolExtensionPath(tool: string): string | undefined {
     google_image_search: join(extBase, "google-image-search", "index.ts"),
     safe_bash: join(SUBAGENTS_DIR, "tools", "safe-bash.ts"),
   };
-  // Prefer the built-in path, but fall back to a runtime-registered extension
-  // when that path no longer exists on disk (e.g. a built-in tool extension
-  // was disabled/removed but a project-local extension re-registered it).
+  const explicitlyRegistered = EXTRA_TOOL_EXTENSIONS.get(tool);
+  if (explicitlyRegistered !== undefined) return explicitlyRegistered;
   const builtin = map[tool];
-  if (builtin && existsSync(builtin)) return builtin;
-  return EXTRA_TOOL_EXTENSIONS.get(tool);
+  return builtin && existsSync(builtin) ? builtin : undefined;
 }
 
 /**
