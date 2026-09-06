@@ -2996,6 +2996,45 @@ describe("subagents widget rendering", () => {
     }
   });
 
+  it("refreshes an installed widget without re-registering and changing its order", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const registration = { installed: false, tui: null };
+    const writes: Array<{ key: string; content: unknown; options: unknown }> = [];
+    let renderRequests = 0;
+    let component: { render(width: number): string[] } | undefined;
+    let agents: Array<any> = [{
+      id: "a1",
+      name: "Worker",
+      task: "",
+      surface: "process-1",
+      startTime: Date.now(),
+      sessionFile: "sess1",
+      statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+    }];
+    const ui = {
+      setWidget(key: string, content: unknown, options?: unknown) {
+        writes.push({ key, content, options });
+        if (typeof content === "function") {
+          component = content({ requestRender: () => { renderRequests += 1; } });
+        }
+      },
+    };
+
+    testApi.syncSubagentStatusWidget(ui, registration, () => agents);
+    agents[0].name = "Worker updated";
+    testApi.syncSubagentStatusWidget(ui, registration, () => agents);
+
+    assert.equal(writes.length, 1);
+    assert.equal(renderRequests, 1);
+    assert.match(component?.render(60).join("\n") ?? "", /Worker updated/);
+
+    agents = [];
+    testApi.syncSubagentStatusWidget(ui, registration, () => agents);
+    testApi.syncSubagentStatusWidget(ui, registration, () => agents);
+    assert.equal(writes.length, 2);
+    assert.equal(writes[1].content, undefined);
+  });
+
   it("renders a detailed monitor with model and sanitized active action", () => {
     const testApi = (subagentsModule as any).__test__;
     const theme = {
