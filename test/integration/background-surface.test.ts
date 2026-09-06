@@ -6,6 +6,8 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { resolveBackgroundBash, withExitSentinel } from "../../pi-extension/subagents/surface.ts";
 import {
   createTestEnv,
   cleanupTestEnv,
@@ -29,6 +31,16 @@ describe("background surface", { timeout: 60_000 }, () => {
 
   after(() => {
     cleanupTestEnv(env);
+  });
+
+  it("preserves the command exit code after printing the completion marker", () => {
+    for (const code of [0, 7, 127]) {
+      const result = spawnSync(resolveBackgroundBash(), ["-c", withExitSentinel(`(exit ${code})`)], {
+        encoding: "utf8", shell: false, timeout: 10_000, windowsHide: true,
+      });
+      assert.equal(result.status, code, result.stderr);
+      assert.match(result.stdout, new RegExp(`__SUBAGENT_DONE_${code}__`));
+    }
   });
 
   it("runs a command and captures its output", async () => {

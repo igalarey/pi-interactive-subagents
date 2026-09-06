@@ -21,6 +21,7 @@ import {
   pollForExit,
   closeSurface,
   shellEscape,
+  withExitSentinel,
   readScreen,
 } from "./surface.ts";
 
@@ -1764,7 +1765,7 @@ async function launchSubagent(
     cmdParts.push(shellEscape(`${params.task}\n\n${summaryInstruction}`));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = withExitSentinel(`${cdPrefix}${cmdParts.join(" ")}`);
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1903,7 +1904,7 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = withExitSentinel(piCommand);
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -2828,7 +2829,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = withExitSentinel(`${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`);
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",

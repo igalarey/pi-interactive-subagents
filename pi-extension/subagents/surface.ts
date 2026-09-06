@@ -89,6 +89,10 @@ export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
+export function withExitSentinel(command: string): string {
+  return `${command}; __pi_exit_status=$?; echo '__SUBAGENT_DONE_'"$__pi_exit_status"'__'; exit "$__pi_exit_status"`;
+}
+
 type BackgroundSurface = {
   child?: ChildProcess;
   outputFile?: string;

@@ -1,312 +1,286 @@
 /**
- * Opt-in integration tests for the full subagent lifecycle.
+ * Opt-in live child-process integration tests.
  *
- * These tests launch real background Pi sessions and make real model calls.
- * Set PI_RUN_LIVE_SUBAGENT_TESTS=1 to enable them.
+ * These tests invoke the extension through a synthetic parent API and launch
+ * only child Pi processes in RPC mode. They do not exercise the parent Pi
+ * loader, parent RPC protocol, TUI, tmux, or Orca. Set
+ * PI_RUN_LIVE_SUBAGENT_TESTS=1 to enable all seven cases.
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all Pi sessions
- *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
+ *   PI_TEST_MODEL       — non-reserved model used by live child sessions
+ *   PI_TEST_AUTH_FILE   — optional concrete auth.json source copied privately
+ *   PI_TEST_MODELS_FILE — optional concrete models.json source copied privately
+ *   PI_TEST_TIMEOUT     — per-test timeout in ms (default: 60000)
  */
-import { describe, it, before, after } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { join, relative } from "node:path";
 import {
   createTestEnv,
-  cleanupTestEnv,
-  createTrackedSurface,
-  startPi,
-  waitForScreen,
-  waitForFile,
-  sleep,
+  createExtensionDriver,
   uniqueId,
-  trackTempFile,
-  readScreen,
   PI_TIMEOUT,
+  TEST_MODEL,
   type TestEnv,
 } from "./harness.ts";
 
 const runLiveTests = process.env.PI_RUN_LIVE_SUBAGENT_TESTS === "1";
+if (runLiveTests && !process.env.PI_TEST_MODEL?.trim()) {
+  throw new Error("PI_TEST_MODEL is required when live subagent tests are enabled.");
+}
+if (runLiveTests && (/astra/i.test(TEST_MODEL) || /:xhigh$/i.test(TEST_MODEL))) {
+  throw new Error("Live subagent tests refuse reserved Astra/xhigh models.");
+}
+if (runLiveTests && (!Number.isFinite(PI_TIMEOUT) || PI_TIMEOUT < 15_000 || PI_TIMEOUT > 120_000)) {
+  throw new Error("PI_TEST_TIMEOUT must be between 15000 and 120000 milliseconds.");
+}
 const describeLive = runLiveTests ? describe : describe.skip;
 
-describeLive("subagent lifecycle", { timeout: PI_TIMEOUT * 3 }, () => {
-    let env: TestEnv;
+type Driver = Awaited<ReturnType<typeof createExtensionDriver>>;
 
-    before(() => {
-      env = createTestEnv();
-    });
+function handoffTask(marker: string): string {
+  return [
+    `Return this completion marker in your final response: ${marker}`,
+    "Use the exact structured handoff headings Status, Summary, Files, Verification, Risks/Blockers, and Next.",
+    "Set Status to complete. Do not call tools.",
+  ].join("\n");
+}
 
-    after(() => {
-      cleanupTestEnv(env);
-    });
+function isResultFor(name: string) {
+  return (entry: { message: any }) =>
+    entry.message?.customType === "subagent_result" && entry.message?.details?.name === name;
+}
 
-    // ── Basic spawn + completion ──
+function sessionEntries(path: string): any[] {
+  return readFileSync(path, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
 
-    it("spawns a subagent that writes a file and verifies the session", async () => {
-      const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-echo-${id}.txt`;
-      trackTempFile(env, markerFile);
+describeLive("subagent lifecycle (synthetic parent, live RPC children)", { timeout: PI_TIMEOUT + 15_000 }, () => {
+  let env: TestEnv;
+  let driver: Driver;
 
-      const surface = createTrackedSurface(env, `echo-${id}`);
-      await sleep(1000);
+  beforeEach(async () => {
+    env = createTestEnv();
+    driver = await createExtensionDriver(env);
+  });
 
-      const task = [
-        `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Echo-${id}"`,
-        `  agent: "test-echo"`,
-        `  task: "Run this bash command: echo 'PASS_${id}' > '${markerFile}'"`,
-        `Do not do anything else. Just call the subagent tool once.`,
-        `After you receive the subagent result, say INTEGRATION_COMPLETE.`,
-      ].join("\n");
+  afterEach(async () => {
+    await driver?.stop();
+  });
 
-      startPi(surface, env.dir, task);
+  it("delivers structured completion from one RPC child", async () => {
+    const id = uniqueId();
+    const name = `Delivery-${id}`;
+    const marker = `DELIVERY_${id}`;
+    const startedAt = Date.now();
 
-      // Verify: subagent created the marker file
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /PASS/);
-      assert.ok(
-        content.includes(`PASS_${id}`),
-        `Marker file should contain PASS_${id}. Got: ${content.trim()}`,
-      );
+    const acknowledgement = await driver.tool("subagent").execute(
+      `spawn-${id}`,
+      { agent: "test-echo", name, model: TEST_MODEL, task: handoffTask(marker) },
+      undefined,
+      undefined,
+      driver.ctx,
+    );
 
-      // Verify: outer pi received the subagent result
-      const screen = await waitForScreen(
-        surface,
-        /INTEGRATION_COMPLETE|completed|Sub-agent.*"Echo/i,
-        PI_TIMEOUT,
-      );
+    assert.equal(acknowledgement.details.status, "started");
+    assert.equal(acknowledgement.details.name, name);
+    assert.ok(Date.now() - startedAt < 10_000, "spawn acknowledgement should be asynchronous");
 
-      // Verify: session file was created (shown in steer result)
-      const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);
-      if (sessionMatch) {
-        const sessionFile = sessionMatch[1];
-        assert.ok(existsSync(sessionFile), `Subagent session file should exist: ${sessionFile}`);
+    const delivered = await driver.waitForMessage(isResultFor(name));
+    assert.equal(delivered.options?.deliverAs, "steer");
+    assert.equal(delivered.options?.triggerTurn, true);
+    assert.equal(delivered.message.details.exitCode, 0);
+    assert.equal(delivered.message.details.handoff?.status, "complete");
+    assert.match(delivered.message.content, new RegExp(marker));
 
-        const lines = readFileSync(sessionFile, "utf8").trim().split("\n");
-        assert.ok(lines.length >= 2, `Session should have ≥2 entries, got ${lines.length}`);
+    const sessionFile = acknowledgement.details.sessionFile as string;
+    assert.equal(existsSync(sessionFile), true);
+    assert.equal(relative(env.parentSessionDir, sessionFile).startsWith(".."), true);
+    assert.equal(relative(env.agentDir, sessionFile).startsWith(".."), false);
+    assert.equal(sessionEntries(sessionFile)[0].cwd, env.dir);
+  });
 
-        const header = JSON.parse(lines[0]);
-        assert.equal(header.type, "session", "First entry should be session header");
-        assert.ok(header.id, "Session header should have an id");
-      }
-    });
+  it("delivers ask_question, accepts a name-addressed RPC reply, then completes", async () => {
+    const id = uniqueId();
+    const name = `Question-${id}`;
+    const question = `QUESTION_${id}`;
+    const completion = `ANSWERED_${id}`;
+    const answer = `REPLY_${id}`;
 
-    // ── In-progress activity snapshots ──
+    const acknowledgement = await driver.tool("subagent").execute(
+      `spawn-${id}`,
+      {
+        agent: "test-question",
+        name,
+        model: TEST_MODEL,
+        task: [
+          `Ask exactly: ${question}`,
+          `After the reply, include ${completion} in the final structured handoff.`,
+        ].join("\n"),
+      },
+      undefined,
+      undefined,
+      driver.ctx,
+    );
+    assert.equal(acknowledgement.details.status, "started");
 
-    it("keeps a long active tool call from surfacing false stalled status", async () => {
-      const id = uniqueId();
-      const startFile = `/tmp/pi-integ-status-start-${id}.txt`;
-      const markerFile = `/tmp/pi-integ-status-${id}.txt`;
-      trackTempFile(env, startFile);
-      trackTempFile(env, markerFile);
+    const asked = await driver.waitForMessage(
+      (entry) => entry.message?.customType === "subagent_question" && entry.message?.details?.name === name,
+    );
+    assert.equal(asked.options?.deliverAs, "steer");
+    assert.equal(asked.options?.triggerTurn, true);
+    assert.equal(asked.message.details.question, question);
 
-      const surface = createTrackedSurface(env, `status-${id}`);
-      await sleep(1000);
+    const messageOffset = driver.sentMessages.length;
+    const steered = await driver.tool("subagent_message").execute(
+      `reply-${id}`,
+      { name, message: answer },
+      undefined,
+      undefined,
+      driver.ctx,
+    );
+    assert.equal(steered.details.status, "steered");
 
-      const task = [
-        `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Status-${id}"`,
-        `  agent: "test-echo"`,
-        `  task: "Run this bash command: echo 'START_${id}' > '${startFile}'; sleep 90; echo 'STATUS_${id}' > '${markerFile}'"`,
-        `Do not do anything else. Just call the subagent tool once.`,
-        `After you receive the subagent result, say STATUS_TEST_DONE.`,
-      ].join("\n");
+    const delivered = await driver.waitForMessage(isResultFor(name), { from: messageOffset });
+    assert.equal(delivered.message.details.exitCode, 0);
+    assert.match(delivered.message.content, new RegExp(completion));
+    assert.match(delivered.message.content, new RegExp(answer));
+  });
 
-      startPi(surface, env.dir, task);
+  it("resumes a finished session by the same name and delivers the follow-up", async () => {
+    const id = uniqueId();
+    const name = `Resume-${id}`;
+    const firstMarker = `FIRST_${id}`;
+    const secondMarker = `SECOND_${id}`;
 
-      const activeScreen = await waitForScreen(surface, /active[\s\S]*bash|bash[\s\S]*active/i, PI_TIMEOUT, 300);
-      assert.doesNotMatch(activeScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
+    const firstAck = await driver.tool("subagent").execute(
+      `spawn-${id}`,
+      { agent: "test-echo", name, model: TEST_MODEL, task: handoffTask(firstMarker) },
+      undefined,
+      undefined,
+      driver.ctx,
+    );
+    const firstDelivery = await driver.waitForMessage(isResultFor(name));
+    assert.equal(firstDelivery.message.details.exitCode, 0);
 
-      await waitForFile(startFile, PI_TIMEOUT, /START_/);
-      assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the long sleep");
-      await sleep(65_000);
-      assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the watchdog assertion");
-      const watchdogScreen = readScreen(surface, 300);
-      assert.doesNotMatch(watchdogScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
+    const messageOffset = driver.sentMessages.length;
+    const resumeAck = await driver.tool("subagent_message").execute(
+      `resume-${id}`,
+      { name, message: handoffTask(secondMarker) },
+      undefined,
+      undefined,
+      driver.ctx,
+    );
+    assert.equal(resumeAck.details.status, "started");
+    assert.equal(resumeAck.details.sessionFile, firstAck.details.sessionFile);
 
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /STATUS_/);
-      assert.ok(content.includes(`STATUS_${id}`), `Marker file should contain STATUS_${id}`);
+    const secondDelivery = await driver.waitForMessage(isResultFor(name), { from: messageOffset });
+    assert.equal(secondDelivery.message.details.exitCode, 0);
+    assert.equal(secondDelivery.message.details.sessionFile, firstAck.details.sessionFile);
+    assert.match(secondDelivery.message.content, new RegExp(secondMarker));
 
-      const completionScreen = await waitForScreen(
-        surface,
-        /STATUS_TEST_DONE|completed|Sub-agent.*"Status-/i,
-        PI_TIMEOUT,
-        300,
-      );
-      assert.ok(/STATUS_TEST_DONE|completed/i.test(completionScreen));
-    });
+    const assistants = sessionEntries(firstAck.details.sessionFile).filter(
+      (entry) => entry.type === "message" && entry.message?.role === "assistant",
+    );
+    assert.ok(assistants.length >= 2, "resume should append a second assistant turn");
+  });
 
-    // ── Parallel subagent spawn ──
+  it("reports a child startup failure without hanging", async () => {
+    const id = uniqueId();
+    const name = `Startup-failure-${id}`;
+    const missingCwd = join(env.dir, `missing-${id}`);
 
-    it("spawns two subagents in parallel and both complete", async () => {
-      const id = uniqueId();
-      const fileA = `/tmp/pi-integ-para-${id}-a.txt`;
-      const fileB = `/tmp/pi-integ-para-${id}-b.txt`;
-      trackTempFile(env, fileA);
-      trackTempFile(env, fileB);
+    const acknowledgement = await driver.tool("subagent").execute(
+      `spawn-${id}`,
+      {
+        agent: "test-echo",
+        name,
+        model: TEST_MODEL,
+        cwd: missingCwd,
+        task: handoffTask(`SHOULD_NOT_RUN_${id}`),
+      },
+      undefined,
+      undefined,
+      driver.ctx,
+    );
+    assert.equal(acknowledgement.details.status, "started");
 
-      const surface = createTrackedSurface(env, `parallel-${id}`);
-      await sleep(1000);
+    const delivered = await driver.waitForMessage(isResultFor(name));
+    assert.notEqual(delivered.message.details.exitCode, 0);
+    assert.match(delivered.message.content, /failed|exit code/i);
+    assert.equal(existsSync(missingCwd), false);
+  });
 
-      const task = [
-        `You must call the subagent tool TWICE. Make both calls before waiting for results.`,
-        ``,
-        `First call:`,
-        `  name: "ParaA-${id}"`,
-        `  agent: "test-echo"`,
-        `  task: "Run: echo 'DONE_A_${id}' > '${fileA}'"`,
-        ``,
-        `Second call:`,
-        `  name: "ParaB-${id}"`,
-        `  agent: "test-echo"`,
-        `  task: "Run: echo 'DONE_B_${id}' > '${fileB}'"`,
-        ``,
-        `Call both subagent tools NOW, do not wait between them.`,
-      ].join("\n");
+  it("delivers two parallel child results independently", async () => {
+    const id = uniqueId();
+    const names = [`Parallel-A-${id}`, `Parallel-B-${id}`];
+    const markers = [`PARALLEL_A_${id}`, `PARALLEL_B_${id}`];
 
-      startPi(surface, env.dir, task);
+    const acknowledgements = await Promise.all(names.map((name, index) =>
+      driver.tool("subagent").execute(
+        `spawn-${id}-${index}`,
+        { agent: "test-echo", name, model: TEST_MODEL, task: handoffTask(markers[index]) },
+        undefined,
+        undefined,
+        driver.ctx,
+      ),
+    ));
+    assert.deepEqual(acknowledgements.map((ack) => ack.details.status), ["started", "started"]);
 
-      // Both marker files should appear
-      const [contentA, contentB] = await Promise.all([
-        waitForFile(fileA, PI_TIMEOUT, /DONE_A/),
-        waitForFile(fileB, PI_TIMEOUT, /DONE_B/),
-      ]);
+    const deliveries = await Promise.all(names.map((name) => driver.waitForMessage(isResultFor(name))));
+    for (const [index, delivered] of deliveries.entries()) {
+      assert.equal(delivered.message.details.exitCode, 0);
+      assert.match(delivered.message.content, new RegExp(markers[index]));
+    }
+    assert.notEqual(acknowledgements[0].details.sessionFile, acknowledgements[1].details.sessionFile);
+  });
 
-      assert.ok(contentA.includes(`DONE_A_${id}`), `File A should contain marker`);
-      assert.ok(contentB.includes(`DONE_B_${id}`), `File B should contain marker`);
-    });
+  it("lists current fixture agents and current public tool contracts", async () => {
+    const listed = await driver.tool("subagents_list").execute("list", {}, undefined, undefined, driver.ctx);
+    const echo = listed.details.agents.find((agent: any) => agent.name === "test-echo");
+    assert.ok(echo, "test-echo should be discoverable from the isolated config dir");
+    assert.equal(echo.capabilities.runtime, "pi");
 
-    // ── Fork mode ──
+    const spawnSchema = driver.tool("subagent").parameters;
+    assert.deepEqual(Object.keys(spawnSchema.properties).sort(), [
+      "agent",
+      "cwd",
+      "model",
+      "name",
+      "task",
+      "useAstraXhigh",
+    ]);
+    assert.equal(spawnSchema.properties.fork, undefined);
+    assert.throws(() => driver.tool("ask_question"), /not registered/);
+  });
 
-    it("fork mode creates a child session linked to the parent", async () => {
-      const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-fork-${id}.txt`;
-      trackTempFile(env, markerFile);
+  it("uses the requested cwd while keeping the child session in normal isolated storage", async () => {
+    const id = uniqueId();
+    const name = `Cwd-${id}`;
+    const marker = `CWD_${id}`;
+    const childCwd = join(env.dir, "child-cwd");
+    mkdirSync(childCwd, { recursive: true });
 
-      const surface = createTrackedSurface(env, `fork-${id}`);
-      await sleep(1000);
+    const acknowledgement = await driver.tool("subagent").execute(
+      `spawn-${id}`,
+      { agent: "test-echo", name, model: TEST_MODEL, cwd: childCwd, task: handoffTask(marker) },
+      undefined,
+      undefined,
+      driver.ctx,
+    );
+    const delivered = await driver.waitForMessage(isResultFor(name));
+    assert.equal(delivered.message.details.exitCode, 0);
 
-      const task = [
-        `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Fork-${id}"`,
-        `  fork: true`,
-        `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
-        `Do not set the agent parameter. Just set name, fork, and task.`,
-        `After you receive the result, say FORK_COMPLETE.`,
-      ].join("\n");
-
-      startPi(surface, env.dir, task);
-
-      // Verify: forked subagent created the file
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /FORK_OK/);
-      assert.ok(content.includes(`FORK_OK_${id}`), `Fork marker file should exist with content`);
-
-      // Wait for the outer pi to show the result
-      const screen = await waitForScreen(
-        surface,
-        /FORK_COMPLETE|completed|Sub-agent.*"Fork/i,
-        PI_TIMEOUT,
-      );
-
-      // Verify: the forked session has a parent link
-      const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);
-      if (sessionMatch) {
-        const sessionFile = sessionMatch[1];
-        assert.ok(existsSync(sessionFile), `Fork session file should exist: ${sessionFile}`);
-
-        const entries = readFileSync(sessionFile, "utf8")
-          .trim()
-          .split("\n")
-          .map((l) => JSON.parse(l));
-        const header = entries[0];
-        assert.equal(header.type, "session", "First entry should be session header");
-        assert.ok(header.parentSession, "Fork session should have parentSession field");
-        // Fork sessions include parent context (model_change entries etc.)
-        assert.ok(entries.length >= 2, "Fork session should have context entries beyond header");
-      }
-    });
-
-    // ── caller_ping ──
-
-    it("subagent caller_ping sends notification back to the parent", async () => {
-      const id = uniqueId();
-
-      const surface = createTrackedSurface(env, `ping-${id}`);
-      await sleep(1000);
-
-      const task = [
-        `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Ping-${id}"`,
-        `  agent: "test-ping"`,
-        `  task: "PING_TEST_${id}"`,
-        `Just call the subagent tool once. Do not do anything else before calling it.`,
-      ].join("\n");
-
-      startPi(surface, env.dir, task);
-
-      // The test-ping agent calls caller_ping, which steers a "needs help" message
-      // back to the outer pi. Look for it on screen.
-      const screen = await waitForScreen(
-        surface,
-        /needs help|PING|caller_ping|ping/i,
-        PI_TIMEOUT,
-      );
-
-      assert.ok(
-        /needs help|PING/i.test(screen),
-        `Screen should show ping notification. Got:\n${screen.slice(-800)}`,
-      );
-    });
-
-    // ── Agent discovery ──
-
-    it("subagent discovers project-local test agents", async () => {
-      const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
-      trackTempFile(env, markerFile);
-
-      const surface = createTrackedSurface(env, `discovery-${id}`);
-      await sleep(1000);
-
-      // Use subagents_list to verify test agents are discoverable,
-      // then spawn one to prove it works end-to-end.
-      const task = [
-        `First, call the subagents_list tool to see available agents.`,
-        `Then call the subagent tool:`,
-        `  name: "Disco-${id}"`,
-        `  agent: "test-echo"`,
-        `  task: "Run: echo 'DISCO_${id}' > '${markerFile}'"`,
-        `After you receive the subagent result, say DISCOVERY_DONE.`,
-      ].join("\n");
-
-      startPi(surface, env.dir, task);
-
-      // The test-echo agent (discovered from project .pi/agents/) should work
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
-      assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
-    });
-
-    // ── Subagent with custom system prompt ──
-
-    it("passes systemPrompt to subagent", async () => {
-      const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-sysprompt-${id}.txt`;
-      trackTempFile(env, markerFile);
-
-      const surface = createTrackedSurface(env, `sysprompt-${id}`);
-      await sleep(1000);
-
-      const task = [
-        `Call the subagent tool with these parameters:`,
-        `  name: "SysP-${id}"`,
-        `  agent: "test-echo"`,
-        `  systemPrompt: "Always start your response with CUSTOM_PROMPT_ACTIVE."`,
-        `  task: "Write 'SYSPROMPT_${id}' to ${markerFile} using bash: echo 'SYSPROMPT_${id}' > '${markerFile}'"`,
-        `After the subagent completes, say SYSPROMPT_TEST_DONE.`,
-      ].join("\n");
-
-      startPi(surface, env.dir, task);
-
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /SYSPROMPT/);
-      assert.ok(content.includes(`SYSPROMPT_${id}`), `System prompt test marker should exist`);
-    });
+    const sessionFile = acknowledgement.details.sessionFile as string;
+    const header = sessionEntries(sessionFile)[0];
+    assert.equal(header.cwd, childCwd);
+    assert.equal(relative(env.agentDir, sessionFile).startsWith(".."), false);
+    assert.equal(relative(env.parentSessionDir, sessionFile).startsWith(".."), true);
+    assert.match(delivered.message.content, new RegExp(marker));
+  });
 });

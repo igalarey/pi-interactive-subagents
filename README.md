@@ -215,6 +215,43 @@ npm run test:smoke
 
 The integration command runs process-only coverage by default; live model tests remain opt-in. The smoke test loads every extension entry point through Pi's real extension loader and exercises `safe_bash` without invoking a model.
 
+### Opt-in live child-process integration
+
+The seven live cases exercise structured result delivery, `ask_question` plus name-addressed reply, finished-session resume, startup failure, parallel delivery, agent/schema discovery, and cwd/session placement. The parent is a **synthetic in-process `ExtensionAPI` driver**; only the children are real Pi processes using JSONL RPC. This is not an E2E test of the parent Pi loader, parent RPC protocol, or TUI/UI. It needs neither Orca nor tmux.
+
+Each test creates a private temporary `PI_CODING_AGENT_DIR` and a separate synthetic parent session directory. Child sessions use Pi's normal cwd-keyed storage beneath that temporary config. The harness never discovers or copies credentials or models from the active home. To opt in, the executor may select only these concrete files:
+
+- `PI_TEST_AUTH_FILE` → copied opaquely to temporary `auth.json`
+- `PI_TEST_MODELS_FILE` → copied opaquely to temporary `models.json`
+
+Either file is optional when environment credentials and the built-in model catalog suffice. Contents are never parsed or printed by the harness. Child processes are terminated before cleanup; fixture deletion failures fail the test and report the retained private fixture path instead of silently leaving secrets behind.
+
+Live calls are never enabled by `npm run test:integration` alone. To run the minimum one-child/one-turn pilot, explicitly select a non-reserved model and, only if needed, concrete config files:
+
+```bash
+# POSIX shells
+PI_TEST_MODEL=openai-codex/gpt-5.6-sol \
+PI_TEST_AUTH_FILE=/explicit/path/to/auth.json \
+npm run test:live:pilot
+```
+
+```powershell
+# PowerShell
+$env:PI_TEST_MODEL = "openai-codex/gpt-5.6-sol"
+$env:PI_TEST_AUTH_FILE = "C:\explicit\path\to\auth.json"
+# Optional when the selected model needs a custom catalog:
+# $env:PI_TEST_MODELS_FILE = "C:\explicit\path\to\models.json"
+npm run test:live:pilot
+```
+
+The pilot defaults to a 60-second per-test deadline. Set `PI_TEST_TIMEOUT` between `15000` and `120000` milliseconds if needed. The runner refuses Astra/xhigh models. It sets `PI_OFFLINE=1` only to suppress Pi startup update/package/telemetry traffic; the live prompt still calls and consumes the explicitly selected model provider.
+
+After the pilot is reviewed, the full seven-case suite can be enabled with `PI_RUN_LIVE_SUBAGENT_TESTS=1`, an explicit non-reserved `PI_TEST_MODEL`, and `npm run test:integration`. Keep `--test-concurrency=1`; the fixtures temporarily set process-wide cwd/config variables.
+
+Verified on native Windows with Pi 0.85.0 and `openai-codex/gpt-5.6-sol`: one-child pilot passed, then all seven cases passed in approximately 36.5 seconds. No terminal-host APIs were used; this does not certify Herdr, other operating systems, or the parent UI. Explicit config copies and test sessions were temporary. Offline coverage includes 176 unit cases, 14 local integration checks and 3 loader/compatibility checks.
+
+The startup-failure case reproduced a launcher bug: printing the completion marker could hide a failed command behind the shell's final zero exit status. Launch and resume scripts now preserve the command status after printing that marker; a model-free subprocess regression covers exit codes 0, 7 and 127.
+
 ## Requirements
 
 - [Pi 0.85.0](https://github.com/earendil-works/pi)
