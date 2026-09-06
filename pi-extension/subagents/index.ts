@@ -1,7 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Box, Text, matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -68,6 +68,11 @@ import {
   STRUCTURED_HANDOFF_INSTRUCTION,
   type StructuredHandoff,
 } from "./handoff.ts";
+import {
+  readRecentSubagentEvents,
+  sanitizeMonitorText,
+  type SubagentMonitorEvent,
+} from "./monitor.ts";
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -709,6 +714,8 @@ interface RunningSubagent {
   name: string;
   task: string;
   agent?: string;
+  model?: string;
+  thinking?: string;
   surface: string;
   startTime: number;
   sessionFile: string;
@@ -876,6 +883,226 @@ function updateWidget() {
     },
     { placement: "aboveEditor" },
   );
+}
+
+function monitorRow(content: string, width: number, theme: Theme): string {
+  if (width <= 0) return "";
+  if (width === 1) return theme.fg("border", "│");
+  const innerWidth = width - 2;
+  const fitted = truncateToWidth(content, innerWidth, "", true);
+  return `${theme.fg("border", "│")}${fitted}${theme.fg("border", "│")}`;
+}
+
+function monitorBorder(position: "top" | "divider" | "bottom", width: number, theme: Theme): string {
+  if (width <= 0) return "";
+  if (width === 1) {
+    return theme.fg("border", position === "top" ? "╭" : position === "bottom" ? "╰" : "├");
+  }
+  const chars = position === "top"
+    ? ["╭", "─", "╮"]
+    : position === "bottom"
+      ? ["╰", "─", "╯"]
+      : ["├", "─", "┤"];
+  return theme.fg("border", `${chars[0]}${chars[1].repeat(width - 2)}${chars[2]}`);
+}
+
+function monitorEventText(event: SubagentMonitorEvent, theme: Theme): string {
+  const prefix = event.kind === "tool"
+    ? theme.fg("accent", "→")
+    : event.kind === "result"
+      ? theme.fg("success", "✓")
+      : event.kind === "error"
+        ? theme.fg("error", "✗")
+        : theme.fg("muted", "•");
+  return ` ${prefix} ${theme.fg(event.kind === "error" ? "error" : "text", event.text)}`;
+}
+
+function renderSubagentMonitorLines(
+  agents: RunningSubagent[],
+  selectedId: string | undefined,
+  width: number,
+  theme: Theme,
+): string[] {
+  const lines = [monitorBorder("top", width, theme)];
+  lines.push(monitorRow(
+    ` ${theme.fg("accent", theme.bold("Subagents"))} ${theme.fg("dim", `· ${agents.length} running`)}`,
+    width,
+    theme,
+  ));
+
+  if (agents.length === 0) {
+    lines.push(monitorRow(` ${theme.fg("muted", "No subagents are currently running.")}`, width, theme));
+    lines.push(monitorRow(` ${theme.fg("dim", "Esc closes this view")}`, width, theme));
+    lines.push(monitorBorder("bottom", width, theme));
+    return lines;
+  }
+
+  let selectedIndex = agents.findIndex((agent) => agent.id === selectedId);
+  if (selectedIndex < 0) selectedIndex = 0;
+  const visibleStart = Math.max(0, Math.min(selectedIndex - 2, Math.max(0, agents.length - 5)));
+  const visibleAgents = agents.slice(visibleStart, visibleStart + 5);
+
+  for (const agent of visibleAgents) {
+    const selected = agent.id === agents[selectedIndex]?.id;
+    const snapshot = classifyStatus(agent.statusState, Date.now());
+    const status = formatWidgetRightLabel(snapshot).trim();
+    const marker = selected ? theme.fg("accent", "▶") : " ";
+    const role = agent.agent ? theme.fg("dim", ` (${agent.agent})`) : "";
+    lines.push(monitorRow(
+      ` ${marker} ${theme.fg(selected ? "accent" : "text", agent.name)}${role} ${theme.fg("dim", `· ${status}`)}`,
+      width,
+      theme,
+    ));
+  }
+  if (agents.length > visibleAgents.length) {
+    lines.push(monitorRow(` ${theme.fg("dim", `${agents.length - visibleAgents.length} more · use ↑↓`)}`, width, theme));
+  }
+
+  const selected = agents[selectedIndex]!;
+  const snapshot = classifyStatus(selected.statusState, Date.now());
+  const model = selected.model
+    ? `${selected.model}${selected.thinking ? `:${selected.thinking}` : ""}`
+    : "default";
+  const task = sanitizeMonitorText(selected.task, 300) || "(no task)";
+  const activeAction = selected.activity?.toolSummary;
+  const activeTool = selected.activity?.toolName;
+  const recentEvents = readRecentSubagentEvents(selected.sessionFile, 6, selected.startTime);
+
+  lines.push(monitorBorder("divider", width, theme));
+  lines.push(monitorRow(` ${theme.fg("accent", theme.bold(selected.name))} ${theme.fg("dim", `· ${formatElapsedMMSS(selected.startTime)}`)}`, width, theme));
+  lines.push(monitorRow(` ${theme.fg("muted", "Model:")} ${model}`, width, theme));
+  lines.push(monitorRow(` ${theme.fg("muted", "Status:")} ${formatWidgetRightLabel(snapshot).trim()}`, width, theme));
+  lines.push(monitorRow(` ${theme.fg("muted", "Task:")} ${task}`, width, theme));
+  if (activeTool) {
+    lines.push(monitorRow(
+      ` ${theme.fg("muted", "Action:")} ${activeTool}${activeAction ? ` · ${activeAction}` : ""}`,
+      width,
+      theme,
+    ));
+  }
+  lines.push(monitorRow(` ${theme.fg("muted", "Recent observable events:")}`, width, theme));
+  if (recentEvents.length === 0) {
+    lines.push(monitorRow(`   ${theme.fg("dim", "No persisted events yet.")}`, width, theme));
+  } else {
+    for (const event of recentEvents) lines.push(monitorRow(monitorEventText(event, theme), width, theme));
+  }
+  lines.push(monitorRow(` ${theme.fg("dim", "↑↓ select · Esc close · updates every 500ms")}`, width, theme));
+  lines.push(monitorBorder("bottom", width, theme));
+  return lines;
+}
+
+async function showSubagentMonitor(ctx: ExtensionContext): Promise<void> {
+  if (ctx.mode !== "tui") {
+    ctx.ui.notify("The live subagent monitor is available in interactive TUI mode.", "warning");
+    return;
+  }
+  if (runningSubagents.size === 0) {
+    ctx.ui.notify("No subagents are currently running.", "info");
+    return;
+  }
+
+  let selectedId = Array.from(runningSubagents.values())[0]?.id;
+  let refreshTimer: ReturnType<typeof setInterval> | undefined;
+  try {
+    await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+      refreshTimer = setInterval(() => {
+        const now = Date.now();
+        for (const running of runningSubagents.values()) observeRunningSubagent(running, now);
+        tui.requestRender();
+      }, 500);
+
+      return {
+        render(width: number) {
+          const agents = Array.from(runningSubagents.values());
+          if (!agents.some((agent) => agent.id === selectedId)) selectedId = agents[0]?.id;
+          return renderSubagentMonitorLines(agents, selectedId, width, theme);
+        },
+        handleInput(data: string) {
+          if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+            done();
+            return;
+          }
+          const agents = Array.from(runningSubagents.values());
+          if (agents.length === 0) return;
+          let index = Math.max(0, agents.findIndex((agent) => agent.id === selectedId));
+          if (matchesKey(data, "up")) index = Math.max(0, index - 1);
+          else if (matchesKey(data, "down")) index = Math.min(agents.length - 1, index + 1);
+          else return;
+          selectedId = agents[index]?.id;
+          tui.requestRender();
+        },
+        invalidate() {},
+        dispose() {
+          if (refreshTimer) clearInterval(refreshTimer);
+        },
+      };
+    }, {
+      overlay: true,
+      overlayOptions: {
+        width: "85%",
+        minWidth: 50,
+        maxHeight: "85%",
+        anchor: "center",
+        margin: 1,
+      },
+    });
+  } finally {
+    if (refreshTimer) clearInterval(refreshTimer);
+  }
+}
+
+function renderSubagentLogLines(
+  name: string,
+  sessionFile: string,
+  width: number,
+  theme: Theme,
+): string[] {
+  const events = readRecentSubagentEvents(sessionFile, 16);
+  const lines = [monitorBorder("top", width, theme)];
+  lines.push(monitorRow(
+    ` ${theme.fg("accent", theme.bold(`Subagent log · ${name}`))}`,
+    width,
+    theme,
+  ));
+  lines.push(monitorRow(` ${theme.fg("dim", sessionFile)}`, width, theme));
+  lines.push(monitorBorder("divider", width, theme));
+  if (events.length === 0) {
+    lines.push(monitorRow(` ${theme.fg("muted", "No observable events found.")}`, width, theme));
+  } else {
+    for (const event of events) lines.push(monitorRow(monitorEventText(event, theme), width, theme));
+  }
+  lines.push(monitorRow(` ${theme.fg("dim", "Esc closes this view")}`, width, theme));
+  lines.push(monitorBorder("bottom", width, theme));
+  return lines;
+}
+
+async function showSubagentLog(
+  ctx: ExtensionContext,
+  name: string,
+  sessionFile: string,
+): Promise<void> {
+  if (ctx.mode !== "tui") {
+    ctx.ui.notify("Subagent logs are available in interactive TUI mode.", "warning");
+    return;
+  }
+  await ctx.ui.custom<void>((_tui, theme, _keybindings, done) => ({
+    render(width: number) {
+      return renderSubagentLogLines(name, sessionFile, width, theme);
+    },
+    handleInput(data: string) {
+      if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) done();
+    },
+    invalidate() {},
+  }), {
+    overlay: true,
+    overlayOptions: {
+      width: "85%",
+      minWidth: 50,
+      maxHeight: "85%",
+      anchor: "center",
+      margin: 1,
+    },
+  });
 }
 
 /**
@@ -1327,6 +1554,8 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 export const __test__ = {
   borderLine,
   renderSubagentWidgetLines,
+  renderSubagentMonitorLines,
+  renderSubagentLogLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
@@ -1511,6 +1740,8 @@ async function launchSubagent(
       name: params.name,
       task: params.task,
       agent: params.agent,
+      model: effectiveModel,
+      thinking: effectiveThinking,
       surface,
       startTime,
       sessionFile: subagentSessionFile,
@@ -1648,6 +1879,8 @@ async function launchSubagent(
     name: params.name,
     task: params.task,
     agent: params.agent,
+    model: effectiveModel,
+    thinking: effectiveThinking,
     surface,
     startTime,
     sessionFile: subagentSessionFile,
@@ -2568,6 +2801,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           id,
           name,
           task: message,
+          agent: loadout.agent ?? undefined,
+          model: loadout.model ?? undefined,
+          thinking: loadout.thinking ?? undefined,
           surface,
           startTime,
           sessionFile: sessionPath,
@@ -2654,6 +2890,63 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
     });
+
+  pi.registerCommand("subagents", {
+    description: "Open the live subagent activity monitor",
+    handler: async (_args, ctx) => {
+      await showSubagentMonitor(ctx);
+    },
+  });
+
+  pi.registerShortcut("ctrl+alt+s", {
+    description: "Open the live subagent activity monitor",
+    handler: async (ctx) => {
+      await showSubagentMonitor(ctx);
+    },
+  });
+
+  pi.registerCommand("subagent-log", {
+    description: "Show recent observable events: /subagent-log <name>",
+    getArgumentCompletions(prefix: string) {
+      const normalized = prefix.toLowerCase();
+      const names = [...new Set(Array.from(runningSubagents.values()).map((running) => running.name))];
+      const matches = names
+        .filter((name) => name.toLowerCase().startsWith(normalized))
+        .map((name) => ({ value: name, label: name }));
+      return matches.length > 0 ? matches : null;
+    },
+    handler: async (args, ctx) => {
+      const requestedName = args.trim();
+      if (!requestedName) {
+        const names = [...new Set(Array.from(runningSubagents.values()).map((running) => running.name))];
+        const hint = names.length > 0 ? ` Running: ${names.join(", ")}.` : "";
+        ctx.ui.notify(`Usage: /subagent-log <name>.${hint}`, "warning");
+        return;
+      }
+
+      const running = Array.from(runningSubagents.values())
+        .find((candidate) => candidate.name === requestedName);
+      let sessionFile = running?.sessionFile;
+
+      if (!sessionFile) {
+        const parentSessionFile = ctx.sessionManager.getSessionFile();
+        if (parentSessionFile) {
+          const parentArtifactDir = getArtifactDir(
+            ctx.sessionManager.getSessionDir(),
+            ctx.sessionManager.getSessionId(),
+          );
+          sessionFile = resolveNameInRegistry(parentArtifactDir, requestedName)?.sessionFile;
+        }
+      }
+
+      if (!sessionFile || !existsSync(sessionFile)) {
+        ctx.ui.notify(`No subagent session named "${requestedName}" was found.`, "error");
+        return;
+      }
+
+      await showSubagentLog(ctx, requestedName, sessionFile);
+    },
+  });
 
   // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {

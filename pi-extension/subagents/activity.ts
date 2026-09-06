@@ -42,6 +42,7 @@ export interface SubagentActivityState {
   messageEventType?: string;
   toolCallId?: string;
   toolName?: string;
+  toolSummary?: string;
   toolStartedAt?: number;
   toolEndedAt?: number;
 }
@@ -64,8 +65,8 @@ export interface SubagentActivityRecorder {
   beforeProviderRequest(): void;
   afterProviderResponse(): void;
   messageUpdate(messageEventType?: string): void;
-  toolExecutionStart(toolCallId?: string, toolName?: string): void;
-  toolCall(toolCallId?: string, toolName?: string): void;
+  toolExecutionStart(toolCallId?: string, toolName?: string, toolSummary?: string): void;
+  toolCall(toolCallId?: string, toolName?: string, toolSummary?: string): void;
   toolExecutionUpdate(toolCallId?: string, toolName?: string): void;
   toolResult(toolCallId?: string, toolName?: string): void;
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
@@ -176,6 +177,7 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateOptionalActivityString(object, "messageEventType"),
     validateOptionalActivityString(object, "toolCallId"),
     validateOptionalActivityString(object, "toolName"),
+    validateOptionalActivityString(object, "toolSummary"),
   ].find((error) => error != null);
   if (validationError) return invalidActivity(validationError);
 
@@ -452,20 +454,22 @@ export function createSubagentActivityRecorder(params: {
         if (!current.toolActive) markActive(current, "streaming", observedAt);
       }, "throttled");
     },
-    toolExecutionStart(toolCallId, toolName) {
+    toolExecutionStart(toolCallId, toolName, toolSummary) {
       record("tool_execution_start", (current, observedAt) => {
         current.toolActive = true;
         current.toolCallId = toolCallId;
         current.toolName = toolName;
+        current.toolSummary = toolSummary;
         current.toolStartedAt = observedAt;
         markActive(current, "tool", observedAt, true);
       }, "immediate");
     },
-    toolCall(toolCallId, toolName) {
+    toolCall(toolCallId, toolName, toolSummary) {
       record("tool_call", (current, observedAt) => {
         current.toolActive = true;
         current.toolCallId = toolCallId ?? current.toolCallId;
         current.toolName = toolName ?? current.toolName;
+        current.toolSummary = toolSummary ?? current.toolSummary;
         markActive(current, "tool", observedAt);
       }, "immediate");
     },

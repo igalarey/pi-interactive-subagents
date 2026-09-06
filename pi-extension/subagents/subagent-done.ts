@@ -17,6 +17,7 @@ import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { summarizeToolActivity } from "./monitor.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -297,11 +298,19 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_start", (event) => {
-    recorder.toolExecutionStart((event as any).toolCallId, (event as any).toolName);
+    recorder.toolExecutionStart(
+      (event as any).toolCallId,
+      (event as any).toolName,
+      summarizeToolActivity((event as any).toolName, (event as any).args),
+    );
   });
 
   pi.on("tool_call", (event) => {
-    recorder.toolCall((event as any).toolCallId, (event as any).toolName);
+    recorder.toolCall(
+      (event as any).toolCallId,
+      (event as any).toolName,
+      summarizeToolActivity((event as any).toolName, (event as any).input),
+    );
   });
 
   pi.on("tool_execution_update", (event) => {
