@@ -762,6 +762,20 @@ let latestPi: ExtensionAPI | null = null;
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
 
+interface SubagentWidgetRegistration {
+  installed: boolean;
+  tui: { requestRender(): void } | null;
+}
+
+interface SubagentWidgetUI {
+  setWidget(key: string, content: unknown, options?: { placement?: "aboveEditor" | "belowEditor" }): void;
+}
+
+const subagentWidgetRegistration: SubagentWidgetRegistration = {
+  installed: false,
+  tui: null,
+};
+
 /** Interval timer for status transition checks. */
 let statusInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -858,31 +872,53 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
   return lines;
 }
 
-function updateWidget() {
-  if (!latestCtx?.hasUI) return;
-
-  if (runningSubagents.size === 0) {
-    latestCtx.ui.setWidget("subagent-status", undefined);
-    if (widgetInterval) {
-      clearInterval(widgetInterval);
-      widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
-    }
+function syncSubagentStatusWidget(
+  ui: SubagentWidgetUI,
+  registration: SubagentWidgetRegistration,
+  getAgents: () => RunningSubagent[],
+): void {
+  if (getAgents().length === 0) {
+    if (registration.installed) ui.setWidget("subagent-status", undefined);
+    registration.installed = false;
+    registration.tui = null;
     return;
   }
 
-  latestCtx.ui.setWidget(
+  if (registration.installed) {
+    registration.tui?.requestRender();
+    return;
+  }
+
+  ui.setWidget(
     "subagent-status",
-    (_tui: any, _theme: any) => {
+    (tui: { requestRender(): void }) => {
+      registration.tui = tui;
       return {
         invalidate() {},
         render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
+          return renderSubagentWidgetLines(getAgents(), width);
         },
       };
     },
     { placement: "aboveEditor" },
   );
+  registration.installed = true;
+}
+
+function updateWidget() {
+  if (!latestCtx?.hasUI) return;
+
+  syncSubagentStatusWidget(
+    latestCtx.ui,
+    subagentWidgetRegistration,
+    () => Array.from(runningSubagents.values()),
+  );
+
+  if (runningSubagents.size === 0 && widgetInterval) {
+    clearInterval(widgetInterval);
+    widgetInterval = null;
+    (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+  }
 }
 
 function monitorRow(content: string, width: number, theme: Theme): string {
@@ -1556,6 +1592,7 @@ export const __test__ = {
   renderSubagentWidgetLines,
   renderSubagentMonitorLines,
   renderSubagentLogLines,
+  syncSubagentStatusWidget,
   loadAgentDefaults,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
@@ -2122,6 +2159,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (_event, _ctx) => {
+    subagentWidgetRegistration.installed = false;
+    subagentWidgetRegistration.tui = null;
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
