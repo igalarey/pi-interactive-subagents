@@ -191,6 +191,8 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
+Use `/subagents` or `Ctrl+Alt+S` to open a live monitor. It shows each running agent's task, model, current tool and sanitized action, plus recent observable tool and assistant events. Use `/subagent-log <name>` to inspect recent events for a running or completed named session. These views read local activity/session artifacts directly in the TUI; they do not add monitoring output to the parent model's context. Thinking blocks are deliberately excluded.
+
 Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
 
 ```json

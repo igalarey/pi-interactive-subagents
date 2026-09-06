@@ -72,6 +72,11 @@ import {
   createSubagentHandoff,
   parseStructuredHandoff,
 } from "../pi-extension/subagents/handoff.ts";
+import {
+  readRecentSubagentEvents,
+  sanitizeMonitorText,
+  summarizeToolActivity,
+} from "../pi-extension/subagents/monitor.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/surface.ts";
 
@@ -101,12 +106,14 @@ function createMockExtensionApi() {
   const registeredTools: Array<any> = [];
   const registeredCommands: Array<any> = [];
   const registeredMessageRenderers: Array<any> = [];
+  const registeredShortcuts: Array<any> = [];
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
   return {
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
+    registeredShortcuts,
     sentUserMessages,
     sentMessages,
     api: {
@@ -120,7 +127,9 @@ function createMockExtensionApi() {
       registerMessageRenderer(name: string, renderer: any) {
         registeredMessageRenderers.push({ name, renderer });
       },
-      registerShortcut() {},
+      registerShortcut(shortcut: string, options: any) {
+        registeredShortcuts.push({ shortcut, ...options });
+      },
       sendUserMessage(message: string) {
         sentUserMessages.push(message);
       },
@@ -1228,6 +1237,78 @@ Next:
   });
 });
 
+describe("subagent monitoring", () => {
+  it("summarizes allowlisted tool arguments and redacts credentials", () => {
+    const command = summarizeToolActivity("bash", {
+      command: "curl -H 'Authorization: Bearer super-secret-token' https://example.com",
+    });
+    assert.match(command ?? "", /curl/);
+    assert.match(command ?? "", /\[redacted\]/);
+    assert.doesNotMatch(command ?? "", /super-secret-token/);
+    assert.equal(
+      summarizeToolActivity("read", { path: "src/index.ts", offset: 20 }),
+      "src/index.ts",
+    );
+    assert.equal(
+      summarizeToolActivity("unknown_tool", { arbitrary: "do not expose", path: "safe/path" }),
+      "safe/path",
+    );
+  });
+
+  it("strips terminal controls and sensitive URL parameters", () => {
+    const sanitized = sanitizeMonitorText(
+      "\u001b[31mGET\u001b[0m https://example.com/data?api_key=secret-value&ok=1\u0007",
+    );
+    assert.doesNotMatch(sanitized, /\u001b|\u0007|secret-value/);
+    assert.match(sanitized, /GET/);
+    assert.match(sanitized, /redacted/);
+  });
+
+  it("builds a recent observable timeline without thinking blocks", () => {
+    withTempDir((dir) => {
+      const sessionFile = createSessionFile(dir, [
+        { type: "session", version: 3, id: "session-id", timestamp: "2026-01-01T00:00:00Z" },
+        {
+          type: "message",
+          timestamp: "2026-01-01T00:00:01Z",
+          message: {
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "private reasoning" },
+              { type: "text", text: "Checking the test suite." },
+              { type: "toolCall", id: "call-1", name: "bash", arguments: { command: "npm test" } },
+            ],
+          },
+        },
+        {
+          type: "message",
+          timestamp: "2026-01-01T00:00:02Z",
+          message: {
+            role: "toolResult",
+            toolCallId: "call-1",
+            toolName: "bash",
+            content: [{ type: "text", text: "tests 10\npass 10" }],
+            isError: false,
+          },
+        },
+      ]);
+
+      const events = readRecentSubagentEvents(sessionFile, 10);
+      assert.deepEqual(events.map((event) => event.kind), ["assistant", "tool", "result"]);
+      assert.match(events[1]!.text, /bash · npm test/);
+      assert.match(events[2]!.text, /pass 10/);
+      assert.doesNotMatch(JSON.stringify(events), /private reasoning/);
+
+      const currentRun = readRecentSubagentEvents(
+        sessionFile,
+        10,
+        Date.parse("2026-01-01T00:00:02Z"),
+      );
+      assert.deepEqual(currentRun.map((event) => event.kind), ["result"]);
+    });
+  });
+});
+
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
@@ -2072,6 +2153,29 @@ describe("commands", () => {
     assert.match(sentUserMessages[0], /map the auth code/);
   });
 
+  it("registers the live monitor, log command, and shortcut", async () => {
+    const { api, registeredCommands, registeredShortcuts } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const monitor = registeredCommands.find((command) => command.name === "subagents");
+    const log = registeredCommands.find((command) => command.name === "subagent-log");
+    const shortcut = registeredShortcuts.find((entry) => entry.shortcut === "ctrl+alt+s");
+    assert.ok(monitor, "expected /subagents to be registered");
+    assert.ok(log, "expected /subagent-log to be registered");
+    assert.ok(shortcut, "expected Ctrl+Alt+S to be registered");
+
+    const notifications: Array<{ message: string; level: string }> = [];
+    await monitor.handler("", {
+      mode: "tui",
+      ui: {
+        notify(message: string, level: string) {
+          notifications.push({ message, level });
+        },
+      },
+    });
+    assert.match(notifications[0]?.message ?? "", /No subagents/);
+  });
+
   it("does not register the removed /iterate or /plan commands", () => {
     const { api, registeredCommands } = createMockExtensionApi();
     (subagentsModule as any).default(api);
@@ -2341,13 +2445,14 @@ describe("subagent activity snapshots", () => {
       });
 
       recorder.sessionStart();
-      recorder.toolExecutionStart("tool-1", "bash");
+      recorder.toolExecutionStart("tool-1", "bash", "npm test");
 
       const read = readSubagentActivityFile(activityFile, "child-1");
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "active");
       assert.equal(read.activity.activeScope, "tool");
       assert.equal(read.activity.toolName, "bash");
+      assert.equal(read.activity.toolSummary, "npm test");
 
       assert.deepEqual(readSubagentActivityFile(activityFile, "other-child"), {
         ok: false,
@@ -2394,6 +2499,7 @@ describe("subagent activity snapshots", () => {
         { runningChildId: 42 },
         { toolActive: "yes" },
         { toolName: "bad\nname" },
+        { toolSummary: "bad\nsummary" },
       ];
 
       for (const [index, overrides] of cases.entries()) {
@@ -2888,6 +2994,55 @@ describe("subagents widget rendering", () => {
     } finally {
       Date.now = originalNow;
     }
+  });
+
+  it("renders a detailed monitor with model and sanitized active action", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const theme = {
+      fg(_color: string, text: string) { return text; },
+      bold(text: string) { return text; },
+    };
+    const now = 1_000_000;
+    const activeState = observeStatus(
+      createStatusState({ source: "pi", startTimeMs: now - 10_000 }),
+      {
+        snapshot: "present",
+        updatedAt: now,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: now - 2_000,
+        activityLabel: "bash",
+      },
+      now,
+    );
+    const agent = {
+      id: "a1",
+      name: "Worker",
+      agent: "worker",
+      model: "openai-codex/gpt-test",
+      thinking: "high",
+      task: "Run the verification suite",
+      surface: "process-1",
+      startTime: now - 10_000,
+      sessionFile: "missing-session.jsonl",
+      statusState: activeState,
+      activity: { toolName: "bash", toolSummary: "npm test" },
+    };
+
+    withMockedNow(now, () => {
+      const readable = testApi.renderSubagentMonitorLines([agent], "a1", 72, theme);
+      const text = readable.join("\n");
+      assert.match(text, /openai-codex\/gpt-test:high/);
+      assert.match(text, /Action: bash · npm test/);
+
+      for (const width of [1, 8, 24, 72]) {
+        for (const line of testApi.renderSubagentMonitorLines([agent], "a1", width, theme)) {
+          assert.ok(visibleWidth(line) <= width);
+        }
+      }
+    });
   });
 
   it("truncates the right-hand status instead of overflowing when it alone is too wide", () => {
