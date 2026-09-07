@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import doneExtension from '../pi-extension/subagents/subagent-done.ts';
-import subagentsExtension from '../pi-extension/subagents/index.ts';
+import subagentsExtension, { __test__ as subagentsTestApi } from '../pi-extension/subagents/index.ts';
 import { cancelOwnedSubagent } from '../pi-extension/subagents/cancellation.ts';
 import { descendantProcessIds } from '../pi-extension/subagents/surface.ts';
 import { readSubagentActivityFile } from '../pi-extension/subagents/activity.ts';
@@ -20,9 +20,15 @@ function setup(t: any) {
   for (const key of Object.keys(process.env)) if (key.startsWith('PI_SUBAGENT_')) delete process.env[key];
   process.env.PI_SUBAGENT_AUTO_EXIT = '1';
   process.env.PI_SUBAGENT_ID = 'fixture';
+  process.env.PI_SUBAGENT_SESSION = path.join(dir, 'session.jsonl');
   process.env.PI_SUBAGENT_ACTIVITY_FILE = path.join(dir, 'activity.json');
   const events = new Map<string, Function>();
-  doneExtension({ on: (name: string, handler: Function) => events.set(name, handler), registerTool() {}, registerShortcut() {} } as any);
+  const tools = new Map<string, any>();
+  doneExtension({
+    on: (name: string, handler: Function) => events.set(name, handler),
+    registerTool(tool: any) { tools.set(tool.name, tool); },
+    registerShortcut() {},
+  } as any);
   let shutdowns = 0;
   const ctx = { shutdown() { shutdowns++; } };
   t.after(() => {
@@ -33,28 +39,97 @@ function setup(t: any) {
     (globalThis as any)[namesKey] = savedNames;
     fs.rmSync(dir, { recursive: true, force: true });
   });
-  return { events, ctx, shutdowns: () => shutdowns, countKey, namesKey,
+  return { events, tools, ctx, dir, shutdowns: () => shutdowns, countKey, namesKey,
     activity: () => readSubagentActivityFile(path.join(dir, 'activity.json'), 'fixture') };
 }
 
-test('normal handoffs wait for named children, expose the reason, then close when drained', t => {
+test('nested handoff delivery wakes the waiting parent and closes exactly once after its completion turn', t => {
   const f = setup(t);
   let children = 1;
   (globalThis as any)[f.countKey] = () => children;
   (globalThis as any)[f.namesKey] = () => ['bootstrap-recon'];
-  for (let i = 0; i < 3; i++) {
-    f.events.get('agent_end')!({ messages: [{ role: 'assistant', stopReason: 'stop' }] }, f.ctx);
-    f.events.get('agent_settled')!({}, f.ctx);
-  }
+
+  // The spawning turn settles while its child is still running. The parent
+  // subagent must remain alive and advertise exactly what it is waiting for.
+  f.events.get('agent_start')!({}, f.ctx);
+  f.events.get('agent_end')!({ messages: [{ role: 'assistant', stopReason: 'stop' }] }, f.ctx);
+  f.events.get('agent_settled')!({}, f.ctx);
   assert.equal(f.shutdowns(), 0);
-  const read = f.activity();
-  assert.equal(read.ok, true);
-  if (!read.ok) return;
-  assert.equal(read.activity.phase, 'waiting');
-  assert.match((read.activity as any).waitingReason, /children.*bootstrap-recon/);
+  const waiting = f.activity();
+  assert.equal(waiting.ok, true);
+  if (!waiting.ok) return;
+  assert.equal(waiting.activity.phase, 'waiting');
+  assert.match((waiting.activity as any).waitingReason, /children.*bootstrap-recon/);
+
+  // index.ts removes the completed child and injects its full handoff with
+  // triggerTurn=true. Reproduce the resulting run: shutdown is requested only
+  // after that handoff-driven turn has completed, never in the delivery gap.
   children = 0;
+  const handoff = '## Handoff\nStatus: complete\nSummary:\n- CHILD_HANDOFF_PRESERVED';
+  f.events.get('agent_start')!({}, f.ctx);
+  f.events.get('agent_end')!({ messages: [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: handoff }] }] }, f.ctx);
+  assert.equal(f.shutdowns(), 0);
   f.events.get('agent_settled')!({}, f.ctx);
   assert.equal(f.shutdowns(), 1);
+
+  // Pi shutdown is deferred; a duplicate settled callback must not use the
+  // retiring context or enqueue a second close.
+  f.events.get('agent_settled')!({}, { shutdown() { throw new Error('duplicate close'); } });
+  assert.equal(f.shutdowns(), 1);
+});
+
+test('pending child question remains parked after notification and closes only after the answer turn', async t => {
+  const f = setup(t);
+  (globalThis as any)[f.countKey] = () => 0;
+  const ask = f.tools.get('ask_question');
+  assert.ok(ask);
+
+  f.events.get('agent_start')!({}, f.ctx);
+  await ask.execute('ask-1', { question: 'Which contract?' });
+  // The parent watcher removes .ask once notification delivery succeeds. That
+  // must not make the question cease being pending before an answer arrives.
+  fs.unlinkSync(path.join(f.dir, 'session.jsonl.ask'));
+  await assert.rejects(
+    () => ask.execute('ask-2', { question: 'A second question?' }),
+    /already has a pending question/i,
+  );
+  f.events.get('agent_end')!({ messages: [{ role: 'assistant', stopReason: 'stop' }] }, f.ctx);
+  f.events.get('agent_settled')!({}, f.ctx);
+  assert.equal(f.shutdowns(), 0);
+
+  f.events.get('input')!({}, f.ctx);
+  f.events.get('agent_start')!({}, f.ctx);
+  f.events.get('agent_end')!({ messages: [{ role: 'assistant', stopReason: 'stop' }] }, f.ctx);
+  f.events.get('agent_settled')!({}, f.ctx);
+  assert.equal(f.shutdowns(), 1);
+});
+
+test('result delivery presentation preserves the complete structured child handoff', () => {
+  const marker = 'CHILD_HANDOFF_PRESERVED';
+  const summary = [
+    '## Handoff',
+    'Status: complete',
+    'Summary:',
+    `- ${marker}`,
+    'Files:',
+    '- src/nested.ts',
+    'Verification:',
+    '- npm test (passed)',
+    'Risks/Blockers:',
+    '- None.',
+    'Next:',
+    '- None.',
+  ].join('\n');
+  const handoff = subagentsTestApi.createSubagentHandoff(summary, { exitCode: 0 });
+  const presentation = subagentsTestApi.resolveResultPresentation(
+    { exitCode: 0, elapsed: 2, summary, handoff },
+    'nested-child',
+  );
+
+  assert.match(presentation, new RegExp(marker));
+  assert.match(presentation, /src\/nested\.ts/);
+  assert.match(presentation, /npm test \(passed\)/);
+  assert.match(presentation, /Reported handoff status: complete/);
 });
 
 test('settled event after shutdown does not use an invalidated context', t => {

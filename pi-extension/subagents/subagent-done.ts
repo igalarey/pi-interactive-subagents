@@ -3,8 +3,8 @@
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+Alt+O)
  * - Provides an `ask_question` tool for asking the parent orchestrator a question
  *
- * Subagents do NOT self-terminate via a tool. Auto-exit agents shut down
- * automatically when their agent loop ends (see the `agent_end` handler);
+ * Subagents do NOT self-terminate via a tool. Auto-exit agents request shutdown
+ * only after the complete run settles (see the `agent_settled` handler);
  * non-auto-exit agents remain available for RPC follow-up messages until terminated.
  *
  * `ask_question` keeps the session OPEN: it writes a `${sessionFile}.ask`
@@ -185,11 +185,13 @@ export default function (pi: ExtensionAPI) {
   // `agent_start` (covers a reply that starts a fresh turn after parking).
   let awaitingAnswer = false;
   let latestAgentMessages: any[] | undefined;
+  let shutdownRequested = false;
   let shuttingDown = false;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     latestAgentMessages = undefined;
+    shutdownRequested = false;
     shuttingDown = false;
     recorder.sessionStart();
     const tools = pi.getAllTools();
@@ -233,7 +235,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
-    if (shuttingDown) return;
+    if (shuttingDown || shutdownRequested) return;
     // Pi emits agent_end before automatic retries, compaction recovery, and
     // queued follow-ups. Publishing terminal state there lets the parent
     // watcher kill the process before those continuations finish.
@@ -266,6 +268,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       recorder.agentEndDone();
+      // ctx.shutdown() is deferred by Pi until the session is idle. Guard the
+      // request as well as session_shutdown so a duplicate/stale settled event
+      // cannot request shutdown twice with a context that is being retired.
+      shutdownRequested = true;
       ctx.shutdown();
       return;
     }
@@ -389,16 +395,24 @@ export default function (pi: ExtensionAPI) {
         agent: process.env.PI_SUBAGENT_AGENT ?? "",
         question: params.question,
       };
+      // The parent removes the sidecar after delivering the notification, not
+      // after receiving an answer. Keep an in-memory pending bit as the source
+      // of truth so the model cannot ask a second question in that interval.
+      if (awaitingAnswer) {
+        throw new Error(
+          "This subagent already has a pending question; wait for the orchestrator's reply before asking another.",
+        );
+      }
+
       // Set this before publishing the sidecar so a fast parent watcher cannot
       // observe the question before auto-exit is suppressed for this turn.
-      const wasAwaitingAnswer = awaitingAnswer;
       awaitingAnswer = true;
       try {
         // Exclusive creation prevents a second unanswered question from
         // replacing the first one while the parent is deciding how to reply.
         writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData), { encoding: "utf8", flag: "wx" });
       } catch (error: any) {
-        awaitingAnswer = wasAwaitingAnswer;
+        awaitingAnswer = false;
         if (error?.code === "EEXIST") {
           throw new Error(
             "This subagent already has a pending question; wait for the orchestrator's reply before asking another.",

@@ -1632,6 +1632,7 @@ export const __test__ = {
   isReservedWorkerModel,
   requestsReservedWorkerEscalation,
   isReservedWorkerLoadout,
+  confirmReservedWorkerEscalation,
   resolveRequestedCwd,
   chooseImplementationRoute,
   formatImplementationRouteDecision,
@@ -1987,30 +1988,45 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   } catch {
     // Malformed/partway-written file — drop it and move on.
   }
-  try {
-    unlinkSync(askFile);
-  } catch {}
-  if (!payload?.question) return;
+  if (!payload?.question) {
+    try {
+      unlinkSync(askFile);
+    } catch {}
+    return;
+  }
+
+  // Keep a valid sidecar until the ExtensionAPI accepts the notification. If
+  // the runtime is temporarily unavailable or sendMessage throws, the next
+  // watcher tick retries instead of silently losing a blocking question.
+  const deliveryPi = latestPi;
+  if (!deliveryPi) return;
 
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
   const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
 
-  latestPi?.sendMessage(
-    {
-      customType: "subagent_question",
-      content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
-      display: true,
-      details: {
-        name,
-        agent: running.agent,
-        question: payload.question,
-        ...(sessionId ? { sessionId } : {}),
+  try {
+    deliveryPi.sendMessage(
+      {
+        customType: "subagent_question",
+        content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
+        display: true,
+        details: {
+          name,
+          agent: running.agent,
+          question: payload.question,
+          ...(sessionId ? { sessionId } : {}),
+        },
       },
-    },
-    { triggerTurn: true, deliverAs: "steer" },
-  );
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  } catch {
+    return;
+  }
+  try {
+    unlinkSync(askFile);
+  } catch {}
 }
 
 async function watchSubagent(
@@ -2153,9 +2169,12 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  let sessionActive = false;
   latestPi = pi;
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
+    sessionActive = true;
+    latestPi = pi;
     latestCtx = ctx;
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
@@ -2167,8 +2186,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
   });
 
-  // Clean up on session shutdown
+  // Clean up on session shutdown. Close surfaces synchronously before Pi can
+  // retire this extension runtime: background surfaces are detached on POSIX,
+  // and merely aborting their watchers can otherwise leave nested descendants
+  // alive after /new, /resume, reload, or process shutdown.
   pi.on("session_shutdown", (_event, _ctx) => {
+    sessionActive = false;
+    if (latestPi === pi) latestPi = null;
+    latestCtx = null;
     subagentWidgetRegistration.installed = false;
     subagentWidgetRegistration.tui = null;
     if (widgetInterval) {
@@ -2183,10 +2208,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
+
+    const closeErrors: Error[] = [];
     for (const [_id, agent] of runningSubagents) {
-      agent.abortController?.abort();
+      try {
+        closeSurface(agent.surface);
+      } catch (error) {
+        closeErrors.push(error instanceof Error ? error : new Error(String(error)));
+      } finally {
+        agent.abortController?.abort();
+      }
     }
     runningSubagents.clear();
+    if (closeErrors.length > 0) {
+      throw new AggregateError(closeErrors, "Failed to terminate running subagents during session shutdown");
+    }
   });
 
   // The spawning tools are always registered here. Whether a child process can
@@ -2429,6 +2465,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            // Session replacement invalidates this extension API. A shutdown
+            // already synchronously terminated the owned process tree, so do
+            // not attempt result delivery through the stale runtime afterward.
+            if (!sessionActive) return;
             updateWidget(); // reflect removal from Map immediately
 
             const presentation = resolveResultPresentation(result, running.name);
@@ -2457,6 +2497,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
+            if (!sessionActive) return;
             updateWidget();
             pi.sendMessage(
               {
@@ -2891,6 +2932,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            if (!sessionActive) return;
             updateWidget();
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
@@ -2929,6 +2971,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
+            if (!sessionActive) return;
             updateWidget();
             pi.sendMessage(
               {

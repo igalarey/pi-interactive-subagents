@@ -1513,6 +1513,31 @@ describe("subagent discovery", () => {
       subagentsModule.registerToolExtension("web_fetch", registered);
       assert.equal(testApi.getToolExtensionPath("web_fetch"), registered);
       assert.deepEqual(testApi.resolveAgentCapabilities({ tools: "web_fetch" }).extensionPaths, [registered]);
+
+      // A registered external bridge remains compatible with Pi's strict
+      // child --tools behavior: its tool name is explicitly allowlisted and
+      // only its owning extension file is re-enabled after --no-extensions.
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "researcher",
+          toolAllowlist: "read,web_fetch,ask_question",
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: null,
+        },
+        { artifactDir: join(globalDir, "artifacts"), name: "bridge-child" },
+      );
+      assert.ok(parts.includes("--no-extensions"));
+      assert.ok(parts[parts.indexOf("--tools") + 1].includes("web_fetch"));
+      assert.ok(parts.some((part, index) => parts[index - 1] === "-e" && part.includes(registered)));
+
       assert.throws(() => subagentsModule.registerToolExtension("web_fetch", legacy), /already registered/);
       assert.throws(() => subagentsModule.registerToolExtension("read", registered), /built-in/);
     });
@@ -2401,22 +2426,8 @@ describe("tool registration", () => {
   });
 
   it("requires user confirmation before reserved worker escalation", async () => {
-    const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
-    assert.ok(subagentTool, "expected subagent tool to be registered");
-
-    const sessionManager = {
-      getSessionFile: () => "/tmp/parent-session.jsonl",
-      getSessionDir: () => "/tmp",
-      getSessionId: () => "parent-session",
-    };
     let confirmations = 0;
-    const result = await subagentTool.execute(
-      "call-1",
-      { agent: "worker", task: "reserved task", useAstraXhigh: true },
-      undefined,
-      undefined,
+    const result = await (subagentsModule as any).__test__.confirmReservedWorkerEscalation(
       {
         hasUI: true,
         ui: {
@@ -2427,38 +2438,23 @@ describe("tool registration", () => {
             return false;
           },
         },
-        sessionManager,
       },
+      "reserved task",
     );
 
     assert.equal(confirmations, 1);
-    assert.equal(result.details?.error, "reserved model not approved");
-    assert.match(result.content[0].text, /not activated/i);
+    assert.equal(result.approved, false);
+    assert.match(result.message, /not activated/i);
   });
 
   it("refuses reserved worker escalation when no interactive UI is available", async () => {
-    const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
-    assert.ok(subagentTool, "expected subagent tool to be registered");
-
-    const result = await subagentTool.execute(
-      "call-1",
-      { agent: "worker", task: "reserved task", model: "gpt-6-astra" },
-      undefined,
-      undefined,
-      {
-        hasUI: false,
-        sessionManager: {
-          getSessionFile: () => "/tmp/parent-session.jsonl",
-          getSessionDir: () => "/tmp",
-          getSessionId: () => "parent-session",
-        },
-      },
+    const result = await (subagentsModule as any).__test__.confirmReservedWorkerEscalation(
+      { hasUI: false },
+      "reserved task",
     );
 
-    assert.equal(result.details?.error, "reserved model not approved");
-    assert.match(result.content[0].text, /interactive UI/i);
+    assert.equal(result.approved, false);
+    assert.match(result.message, /interactive UI/i);
   });
 
   it("recognizes the reserved Astra/xhigh loadout on resume", () => {
