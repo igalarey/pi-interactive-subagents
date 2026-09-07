@@ -22,22 +22,42 @@ export default async function fauxNestedLifecycle(pi: ExtensionAPI) {
     "providers",
     "faux.js",
   );
-  const { fauxAssistantMessage, fauxProvider } = await import(pathToFileURL(fauxPath).href);
+  const { fauxAssistantMessage, fauxProvider, fauxToolCall } = await import(pathToFileURL(fauxPath).href);
   const faux = fauxProvider({
     provider: "lifecycle-faux",
     models: [{ id: "nested", name: "Nested lifecycle fixture" }],
   });
 
   const childMarker = "OFFLINE_CHILD_HANDOFF";
+  const answerMarker = "OFFLINE_PARENT_ANSWER";
+  let inputCount = 0;
+  pi.on("input", () => {
+    inputCount += 1;
+  });
   faux.setResponses([
-    fauxAssistantMessage("Child is still running; wait for its delivered handoff."),
+    fauxAssistantMessage(
+      fauxToolCall("ask_question", { question: "Which contract should I use?" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("Waiting for the parent answer while my child is still running."),
     (context: unknown) => {
       const sawHandoff = JSON.stringify(context).includes(childMarker);
+      return fauxAssistantMessage(
+        sawHandoff
+          ? `Observed ${childMarker}, but it does not answer my pending parent question.`
+          : "MISSING_CHILD_HANDOFF",
+      );
+    },
+    (context: unknown) => {
+      const serialized = JSON.stringify(context);
+      const sawHandoff = serialized.includes(childMarker);
+      const sawAnswer = serialized.includes(answerMarker);
+      const sawOnlyRpcInputs = inputCount === 2;
       return fauxAssistantMessage([
         "## Handoff",
-        `Status: ${sawHandoff ? "complete" : "failed"}`,
+        `Status: ${sawHandoff && sawAnswer && sawOnlyRpcInputs ? "complete" : "failed"}`,
         "Summary:",
-        `- ${sawHandoff ? `Integrated ${childMarker}` : "MISSING_CHILD_HANDOFF"}`,
+        `- ${sawHandoff && sawAnswer && sawOnlyRpcInputs ? `Integrated ${childMarker} after ${answerMarker}; RPC_INPUT_COUNT_${inputCount}` : `MISSING_HANDOFF_OR_ANSWER; RPC_INPUT_COUNT_${inputCount}`}`,
         "Files:",
         "- None.",
         "Verification:",

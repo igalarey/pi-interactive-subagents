@@ -2133,7 +2133,7 @@ describe("subagent-done.ts", () => {
       }
     });
 
-    it("exits when the reply arrives as a new turn (agent_start also clears the flag)", async () => {
+    it("exits when an input reply starts a new turn", async () => {
       const dir = createTestDir();
       const { emit, ask, restore } = setupCapturingExtension(join(dir, "s.jsonl"));
       try {
@@ -2144,7 +2144,8 @@ describe("subagent-done.ts", () => {
         emit("agent_end", { messages: [] }, ctx1);
         emit("agent_settled", {}, ctx1);
         assert.equal(shutdown1, false, "parks while waiting");
-        // Reply arrives as a fresh turn after the subagent had parked.
+        // Reply arrives as a fresh RPC/user input after the subagent parked.
+        // input clears the pending gate; agent_start alone intentionally does not.
         emit("input");
         emit("agent_start");
         let shutdown2 = false;

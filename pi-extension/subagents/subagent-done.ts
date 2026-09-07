@@ -180,9 +180,9 @@ export default function (pi: ExtensionAPI) {
   let userTookOver = false;
   let agentStarted = false;
   // Set when ask_question is called; suppresses auto-exit so the session stays
-  // open while it waits for the orchestrator's reply. Cleared when the reply
-  // lands — on `input` (covers a reply steered into the current run) and on
-  // `agent_start` (covers a reply that starts a fresh turn after parking).
+  // open while it waits for the orchestrator's reply. Only `input` clears it:
+  // child-result custom messages can trigger their own agent runs without
+  // answering the question, while RPC prompt/steer replies do emit `input`.
   let awaitingAnswer = false;
   let latestAgentMessages: any[] | undefined;
   let shutdownRequested = false;
@@ -224,9 +224,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     agentStarted = true;
-    // A new turn is starting — any pending ask_question has now been answered
-    // (or superseded), so let auto-exit resume normally when this turn ends.
-    awaitingAnswer = false;
+    // Do not clear awaitingAnswer here. Extension-injected child handoffs can
+    // start a run without being the parent's answer; only the input event is
+    // evidence that an RPC/user reply actually arrived.
     recorder.agentStart();
   });
 
@@ -272,7 +272,15 @@ export default function (pi: ExtensionAPI) {
       // request as well as session_shutdown so a duplicate/stale settled event
       // cannot request shutdown twice with a context that is being retired.
       shutdownRequested = true;
-      ctx.shutdown();
+      try {
+        ctx.shutdown();
+      } catch (error) {
+        // A rejected request did not schedule shutdown. Let a later settled
+        // event retry with its fresh context and keep this error observable to
+        // Pi's extension error reporting.
+        shutdownRequested = false;
+        throw error;
+      }
       return;
     }
 

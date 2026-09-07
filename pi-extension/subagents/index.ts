@@ -1633,6 +1633,7 @@ export const __test__ = {
   requestsReservedWorkerEscalation,
   isReservedWorkerLoadout,
   confirmReservedWorkerEscalation,
+  canDeliverToSession,
   resolveRequestedCwd,
   chooseImplementationRoute,
   formatImplementationRouteDecision,
@@ -1642,6 +1643,14 @@ export const __test__ = {
   createSubagentHandoff,
   parseStructuredHandoff,
 };
+
+function canDeliverToSession(
+  sessionActive: boolean,
+  currentGeneration: number,
+  deliveryGeneration: number,
+): boolean {
+  return sessionActive && currentGeneration === deliveryGeneration;
+}
 
 function startWidgetRefresh() {
   if (widgetInterval) return;
@@ -2170,9 +2179,11 @@ async function watchSubagent(
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   let sessionActive = false;
+  let sessionGeneration = 0;
   latestPi = pi;
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
+    sessionGeneration += 1;
     sessionActive = true;
     latestPi = pi;
     latestCtx = ctx;
@@ -2192,6 +2203,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // alive after /new, /resume, reload, or process shutdown.
   pi.on("session_shutdown", (_event, _ctx) => {
     sessionActive = false;
+    sessionGeneration += 1;
     if (latestPi === pi) latestPi = null;
     latestCtx = null;
     subagentWidgetRegistration.installed = false;
@@ -2462,13 +2474,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startWidgetRefresh();
         startStatusRefresh(pi);
 
-        // Fire-and-forget: start watching in background
+        // Fire-and-forget: start watching in background. Capture the session
+        // generation so an old completion cannot cross a /new or /resume
+        // boundary if Pi reuses this extension instance.
+        const deliveryGeneration = sessionGeneration;
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             // Session replacement invalidates this extension API. A shutdown
             // already synchronously terminated the owned process tree, so do
             // not attempt result delivery through the stale runtime afterward.
-            if (!sessionActive) return;
+            if (!canDeliverToSession(sessionActive, sessionGeneration, deliveryGeneration)) return;
             updateWidget(); // reflect removal from Map immediately
 
             const presentation = resolveResultPresentation(result, running.name);
@@ -2497,7 +2512,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
-            if (!sessionActive) return;
+            if (!canDeliverToSession(sessionActive, sessionGeneration, deliveryGeneration)) return;
             updateWidget();
             pi.sendMessage(
               {
@@ -2930,9 +2945,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
+        const deliveryGeneration = sessionGeneration;
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
-            if (!sessionActive) return;
+            if (!canDeliverToSession(sessionActive, sessionGeneration, deliveryGeneration)) return;
             updateWidget();
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
@@ -2971,7 +2987,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             );
           })
           .catch((err) => {
-            if (!sessionActive) return;
+            if (!canDeliverToSession(sessionActive, sessionGeneration, deliveryGeneration)) return;
             updateWidget();
             pi.sendMessage(
               {

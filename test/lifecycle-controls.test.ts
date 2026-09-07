@@ -97,6 +97,13 @@ test('pending child question remains parked after notification and closes only a
   f.events.get('agent_settled')!({}, f.ctx);
   assert.equal(f.shutdowns(), 0);
 
+  // A grandchild result can trigger a fresh agent run, but it is not an answer
+  // to this pending parent question. agent_start alone must not clear the gate.
+  f.events.get('agent_start')!({}, f.ctx);
+  f.events.get('agent_end')!({ messages: [{ role: 'assistant', stopReason: 'stop' }] }, f.ctx);
+  f.events.get('agent_settled')!({}, f.ctx);
+  assert.equal(f.shutdowns(), 0);
+
   f.events.get('input')!({}, f.ctx);
   f.events.get('agent_start')!({}, f.ctx);
   f.events.get('agent_end')!({ messages: [{ role: 'assistant', stopReason: 'stop' }] }, f.ctx);
@@ -130,6 +137,26 @@ test('result delivery presentation preserves the complete structured child hando
   assert.match(presentation, /src\/nested\.ts/);
   assert.match(presentation, /npm test \(passed\)/);
   assert.match(presentation, /Reported handoff status: complete/);
+});
+
+test('a thrown shutdown request remains visible and retries with a fresh settled context', t => {
+  const f = setup(t);
+  (globalThis as any)[f.countKey] = () => 0;
+  f.events.get('agent_end')!({ messages: [{ role: 'assistant', stopReason: 'stop' }] }, f.ctx);
+
+  assert.throws(
+    () => f.events.get('agent_settled')!({}, { shutdown() { throw new Error('stale ctx rejected'); } }),
+    /stale ctx rejected/,
+  );
+  assert.equal(f.shutdowns(), 0);
+  assert.doesNotThrow(() => f.events.get('agent_settled')!({}, f.ctx));
+  assert.equal(f.shutdowns(), 1);
+});
+
+test('session generation rejects old watcher delivery after a replacement session starts', () => {
+  assert.equal(subagentsTestApi.canDeliverToSession(true, 3, 1), false);
+  assert.equal(subagentsTestApi.canDeliverToSession(false, 1, 1), false);
+  assert.equal(subagentsTestApi.canDeliverToSession(true, 3, 3), true);
 });
 
 test('settled event after shutdown does not use an invalidated context', t => {

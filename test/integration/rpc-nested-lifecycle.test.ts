@@ -54,17 +54,41 @@ test("official Pi RPC closes a nested parent only after the delivered child hand
   });
 
   let stdout = "";
+  let stdoutBuffer = "";
   let stderr = "";
+  let observedSettlements = 0;
+  let answerSent = false;
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+    stdoutBuffer += chunk;
+    for (;;) {
+      const newline = stdoutBuffer.indexOf("\n");
+      if (newline < 0) break;
+      const line = stdoutBuffer.slice(0, newline).replace(/\r$/, "");
+      stdoutBuffer = stdoutBuffer.slice(newline + 1);
+      if (!line.trim()) continue;
+      const record = JSON.parse(line);
+      if (record.type !== "agent_settled") continue;
+      observedSettlements += 1;
+      if (observedSettlements === 2 && !answerSent) {
+        answerSent = true;
+        child.stdin.write(`${JSON.stringify({
+          id: "parent-answer",
+          type: "prompt",
+          message: "Use this contract: OFFLINE_PARENT_ANSWER",
+        })}\n`);
+      }
+    }
+  });
   child.stderr.on("data", (chunk) => { stderr += chunk; });
 
   const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
     child.once("error", reject);
     child.once("close", (code, signal) => resolve({ code, signal }));
   });
-  child.stdin.end(`${JSON.stringify({ id: "start", type: "prompt", message: "Run the nested lifecycle fixture." })}\n`);
+  child.stdin.write(`${JSON.stringify({ id: "start", type: "prompt", message: "Run the nested lifecycle fixture." })}\n`);
 
   const outcome = await closed;
   assert.equal(outcome.signal, null, `Pi RPC was killed by ${outcome.signal}; stderr: ${stderr}`);
@@ -78,14 +102,21 @@ test("official Pi RPC closes a nested parent only after the delivered child hand
     .map((line) => JSON.parse(line));
   assert.ok(records.some((record) =>
     record.type === "response" && record.id === "start" && record.success === true
-  ), "RPC prompt was not accepted");
+  ), "initial RPC prompt was not accepted");
+  assert.ok(records.some((record) =>
+    record.type === "response" && record.id === "parent-answer" && record.success === true
+  ), "parent RPC answer was not accepted");
 
   const starts = records.filter((record) => record.type === "agent_start");
   const ends = records.filter((record) => record.type === "agent_end");
   const settled = records.filter((record) => record.type === "agent_settled");
-  assert.equal(starts.length, 2, "expected the spawning turn and one handoff-integration turn");
-  assert.equal(ends.length, 2, "both real agent runs must complete before shutdown");
-  assert.equal(settled.length, 2, "the first settlement must park and the second must close");
+  assert.equal(starts.length, 3, "expected ask, child-handoff, and parent-answer runs");
+  assert.equal(ends.length, 3, "all three real agent runs must complete before shutdown");
+  assert.equal(
+    settled.length,
+    3,
+    "the pending question must survive the child-result turn and close only after the RPC answer",
+  );
 
   const entries = readFileSync(sessionFile, "utf8")
     .split("\n")
@@ -107,6 +138,7 @@ test("official Pi RPC closes a nested parent only after the delivered child hand
     .filter((block: any) => block.type === "text")
     .map((block: any) => block.text)
     .join("\n");
-  assert.match(finalText, /Integrated OFFLINE_CHILD_HANDOFF/);
-  assert.doesNotMatch(finalText, /MISSING_CHILD_HANDOFF/);
+  assert.match(finalText, /Integrated OFFLINE_CHILD_HANDOFF after OFFLINE_PARENT_ANSWER/);
+  assert.match(finalText, /RPC_INPUT_COUNT_2/);
+  assert.doesNotMatch(finalText, /MISSING_HANDOFF_OR_ANSWER/);
 });
