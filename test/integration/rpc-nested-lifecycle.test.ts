@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { cleanupTestEnv, createTestEnv } from "./harness.ts";
@@ -12,46 +13,145 @@ const PI_CLI = join(ROOT, "node_modules", "@earendil-works", "pi-coding-agent", 
 const DONE_EXTENSION = join(ROOT, "pi-extension", "subagents", "subagent-done.ts");
 const FIXTURE_EXTENSION = join(HERE, "fixtures", "faux-nested-lifecycle.ts");
 
-function cleanChildEnvironment(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (!key.toUpperCase().startsWith("PI_SUBAGENT_") && value !== undefined) env[key] = value;
+function isolatedChildEnvironment(root: string): NodeJS.ProcessEnv {
+  const home = join(root, "home");
+  const temp = join(root, "tmp");
+  const xdgConfig = join(root, "xdg-config");
+  const xdgData = join(root, "xdg-data");
+  const xdgCache = join(root, "xdg-cache");
+  const appData = join(root, "appdata");
+  const localAppData = join(root, "local-appdata");
+  for (const dir of [home, temp, xdgConfig, xdgData, xdgCache, appData, localAppData]) {
+    mkdirSync(dir, { recursive: true });
   }
-  return env;
+
+  // Pass only process-launch essentials. In particular, do not inherit API
+  // keys, credentials, PI_* configuration, or the executor's home/XDG paths.
+  const childEnv: NodeJS.ProcessEnv = {};
+  for (const key of ["PATH", "Path", "PATHEXT", "SystemRoot", "WINDIR", "COMSPEC"]) {
+    const value = process.env[key];
+    if (value !== undefined) childEnv[key] = value;
+  }
+  return {
+    ...childEnv,
+    HOME: home,
+    USERPROFILE: home,
+    XDG_CONFIG_HOME: xdgConfig,
+    XDG_DATA_HOME: xdgData,
+    XDG_CACHE_HOME: xdgCache,
+    APPDATA: appData,
+    LOCALAPPDATA: localAppData,
+    TEMP: temp,
+    TMP: temp,
+    TMPDIR: temp,
+  };
 }
+
+async function waitForClose(
+  closed: Promise<unknown>,
+  timeoutMs: number,
+): Promise<boolean> {
+  return Promise.race([
+    closed.then(() => true, () => true),
+    delay(timeoutMs).then(() => false),
+  ]);
+}
+
+function createBoundedStop(child: ChildProcess, closed: Promise<unknown>): () => Promise<void> {
+  let stopPromise: Promise<void> | undefined;
+  return () => {
+    if (stopPromise) return stopPromise;
+    stopPromise = (async () => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        await closed.catch(() => {});
+        return;
+      }
+
+      child.stdin?.destroy();
+      child.kill("SIGTERM");
+      if (await waitForClose(closed, 2_000)) return;
+
+      child.kill("SIGKILL");
+      if (await waitForClose(closed, 2_000)) return;
+      throw new Error(`Timed out terminating Pi RPC fixture process ${child.pid ?? "(no pid)"}`);
+    })();
+    return stopPromise;
+  };
+}
+
+test("bounded fixture teardown awaits a hung child before deleting its isolated home", { timeout: 10_000 }, async (t) => {
+  const env = createTestEnv();
+  let child: ChildProcess;
+  try {
+    child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      cwd: env.dir,
+      env: isolatedChildEnvironment(env.root),
+      stdio: ["ignore", "ignore", "ignore"],
+      windowsHide: true,
+    });
+  } catch (error) {
+    cleanupTestEnv(env);
+    throw error;
+  }
+  const closed = new Promise<void>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", () => resolve());
+  });
+  const stopChild = createBoundedStop(child, closed);
+  t.after(async () => {
+    await stopChild();
+    cleanupTestEnv(env);
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
+  await stopChild();
+  assert.notEqual(child.signalCode ?? child.exitCode, null);
+});
 
 test("official Pi RPC closes a nested parent only after the delivered child handoff settles", { timeout: 30_000 }, async (t) => {
   const env = createTestEnv();
-  t.after(() => cleanupTestEnv(env));
 
   const sessionFile = join(env.root, "rpc-nested.jsonl");
   const activityFile = join(env.root, "rpc-nested.activity.json");
   mkdirSync(dirname(activityFile), { recursive: true });
 
-  const child = spawn(process.execPath, [
-    PI_CLI,
-    "--mode", "rpc",
-    "--session", sessionFile,
-    "--no-extensions",
-    "--tools", "ask_question",
-    "-e", DONE_EXTENSION,
-    "-e", FIXTURE_EXTENSION,
-    "--model", "lifecycle-faux/nested",
-  ], {
-    cwd: env.dir,
-    env: {
-      ...cleanChildEnvironment(),
-      PI_OFFLINE: "1",
-      PI_CODING_AGENT_DIR: env.agentDir,
-      PI_SUBAGENT_AUTO_EXIT: "1",
-      PI_SUBAGENT_SESSION: sessionFile,
-      PI_SUBAGENT_ID: "offline-nested-parent",
-      PI_SUBAGENT_NAME: "offline-nested-parent",
-      PI_SUBAGENT_ACTIVITY_FILE: activityFile,
-    },
-    stdio: ["pipe", "pipe", "pipe"],
-    windowsHide: true,
-  });
+  let child: ChildProcess;
+  try {
+    child = spawn(process.execPath, [
+      PI_CLI,
+      "--mode", "rpc",
+      "--session", sessionFile,
+      "--no-extensions",
+      "--no-skills",
+      "--no-context-files",
+      "--no-prompt-templates",
+      "--no-themes",
+      "--tools", "ask_question",
+      "-e", DONE_EXTENSION,
+      "-e", FIXTURE_EXTENSION,
+      "--model", "lifecycle-faux/nested",
+    ], {
+      cwd: env.dir,
+      env: {
+        ...isolatedChildEnvironment(env.root),
+        PI_OFFLINE: "1",
+        PI_CODING_AGENT_DIR: env.agentDir,
+        PI_SUBAGENT_AUTO_EXIT: "1",
+        PI_SUBAGENT_SESSION: sessionFile,
+        PI_SUBAGENT_ID: "offline-nested-parent",
+        PI_SUBAGENT_NAME: "offline-nested-parent",
+        PI_SUBAGENT_ACTIVITY_FILE: activityFile,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+  } catch (error) {
+    cleanupTestEnv(env);
+    throw error;
+  }
 
   let stdout = "";
   let stdoutBuffer = "";
@@ -88,6 +188,13 @@ test("official Pi RPC closes a nested parent only after the delivered child hand
     child.once("error", reject);
     child.once("close", (code, signal) => resolve({ code, signal }));
   });
+  const stopChild = createBoundedStop(child, closed);
+  t.signal.addEventListener("abort", () => { void stopChild().catch(() => {}); }, { once: true });
+  t.after(async () => {
+    await stopChild();
+    cleanupTestEnv(env);
+  });
+
   child.stdin.write(`${JSON.stringify({ id: "start", type: "prompt", message: "Run the nested lifecycle fixture." })}\n`);
 
   const outcome = await closed;
