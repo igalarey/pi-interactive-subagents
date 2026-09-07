@@ -340,9 +340,9 @@ export function registerToolExtension(name: string, extensionPath: string): void
 // Expose registration on a process-global so project-local extensions loaded
 // via jiti (separate module instances) can reach this shared map. Set at module
 // load so it's available before any `session_start` listener runs.
-(globalThis as any).__pi_interactive_subagents = {
-  registerToolExtension,
-};
+const toolExtensionRegistry = { registerToolExtension };
+(globalThis as any).__pi_interactive_subagents = toolExtensionRegistry;
+(globalThis as any)[Symbol.for("pi.subagents.tool-extension-registry")] = toolExtensionRegistry;
 
 /**
  * Map a custom (non-built-in) tool name to the pi-extension file that

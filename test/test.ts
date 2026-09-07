@@ -1501,6 +1501,28 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("shares the Symbol MCP bridge with legacy registration and child launch resolution", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      const registry = (globalThis as any)[Symbol.for("pi.subagents.tool-extension-registry")];
+      assert.ok(registry, "Symbol registry must be published by the real subagent module");
+      assert.equal(registry, (globalThis as any).__pi_interactive_subagents);
+      const extension = join(globalDir, "mcp-bridge.ts");
+      writeFileSync(extension, "export default () => {};\n");
+      registry.registerToolExtension("mcp", extension);
+      registry.registerToolExtension("mcpScript", extension);
+      const capabilities = testApi.resolveAgentCapabilities({ tools: "mcp,mcpScript" });
+      assert.deepEqual(capabilities.extensionPaths, [extension]);
+      const parts: string[] = [];
+      testApi.applySandboxToParts(parts, {
+        agent: "worker", toolAllowlist: "read,mcp,mcpScript,ask_question", model: null,
+        thinking: null, systemPromptMode: null, identity: null, spawnable: null,
+        autoExit: true, cwd: null, agentDir: null,
+      }, { artifactDir: join(globalDir, "artifacts"), name: "mcp-child" });
+      assert.ok(parts.includes("--no-extensions"));
+      assert.ok(parts.some((part, index) => parts[index - 1] === "-e" && part.includes(extension)));
+    });
+  });
+
   it("pins registered tool extensions ahead of legacy discovery without allowing conflicting registrations", async () => {
     await withIsolatedAgentEnv(async ({ globalDir }) => {
       const legacy = join(globalDir, "extensions", "web-fetch", "index.ts");
