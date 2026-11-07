@@ -1,3 +1,4 @@
+import { validateExtensionBindingSnapshot, type ExtensionBindingProfile } from "./extension-bindings.ts";
 import {
   appendFileSync,
   closeSync,
@@ -95,11 +96,16 @@ export function seedSubagentSessionFile(params: {
  * deleted.
  */
 export interface SubagentLoadout {
+  extensionBindings?: Record<string, string>;
+  extensionBindingProfiles?: Record<string, ExtensionBindingProfile>;
   /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
   toolAllowlist: string | null;
   disableSkills?: boolean;
+  skillPolicy?: "personal-named" | "disabled" | "unrestricted";
+  skillPaths?: string[];
+  skillCatalogPaths?: string[];
   disableExtensions?: boolean;
   maxTurns?: number;
   /** Model id (without thinking suffix), or null to use the session default. */
@@ -147,12 +153,25 @@ function nullableString(value: unknown): value is string | null {
 function validSubagentLoadout(value: unknown): value is SubagentLoadout {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const input = value as Record<string, unknown>;
-  const optionalKeys = ["disableSkills", "disableExtensions", "maxTurns"];
+  const optionalKeys = ["disableSkills", "disableExtensions", "maxTurns", "skillPolicy", "skillPaths", "skillCatalogPaths", "extensionBindings", "extensionBindingProfiles"];
   if (Object.keys(input).some(key => !(LOADOUT_KEYS as readonly string[]).includes(key) && !optionalKeys.includes(key))) return false;
   for (const key of ["disableSkills", "disableExtensions"]) {
     if (Object.hasOwn(input, key) && typeof input[key] !== "boolean") return false;
   }
   if (Object.hasOwn(input, "maxTurns") && (typeof input.maxTurns !== "number" || !Number.isSafeInteger(input.maxTurns) || input.maxTurns <= 0)) return false;
+  if (input.skillPolicy !== undefined) {
+    if (!["personal-named", "disabled", "unrestricted"].includes(input.skillPolicy as string)) return false;
+    if (!Array.isArray(input.skillPaths) || input.skillPaths.length > 100 ||
+        input.skillPaths.some(path => typeof path !== "string" || !path || path.length > 32768)) return false;
+    if (input.skillPolicy !== "personal-named" && input.skillPaths.length !== 0) return false;
+    if (input.skillPolicy !== "unrestricted" && input.disableSkills !== true) return false;
+    if (input.skillPolicy === "unrestricted" && (input.toolAllowlist !== null || input.disableSkills === true)) return false;
+  } else if (input.skillPaths !== undefined) return false;
+  if (input.skillCatalogPaths !== undefined) {
+    if (!Array.isArray(input.skillCatalogPaths) || input.skillCatalogPaths.length > 100 ||
+        input.skillCatalogPaths.some(path => typeof path !== "string" || !path || path.length > 32768)) return false;
+    if (input.skillPolicy === undefined || (input.skillCatalogPaths.length > 0 && input.skillPolicy !== "personal-named")) return false;
+  }
   if (!LOADOUT_KEYS.every((key) => Object.hasOwn(input, key))) return false;
   if (!nullableString(input.agent) || !nullableString(input.toolAllowlist)) return false;
   if (!nullableString(input.model) || !nullableString(input.thinking)) return false;
@@ -164,6 +183,7 @@ function validSubagentLoadout(value: unknown): value is SubagentLoadout {
     input.spawnable.length > 1_000 ||
     input.spawnable.some((name) => typeof name !== "string" || !name || name.length > 200)
   )) return false;
+  try { validateExtensionBindingSnapshot(input as unknown as SubagentLoadout); } catch { return false; }
   return true;
 }
 

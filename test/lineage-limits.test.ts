@@ -519,3 +519,27 @@ test("existing lineage keeps launch usage when root explicitly changes finite li
   assert.equal(ledger.launchesUsed, 1);
   assert.equal(ledger.limits.maxLaunchesPerLineage, 20);
 });
+
+test("non-root child cap counts simultaneous reservations and resumes without inherited escalation", async (t) => {
+  const file = fixture(t);
+  const limits = { ...DEFAULT_DELEGATION_LIMITS, maxConcurrentDescendants: 6, maxConcurrentChildren: 2 };
+  await ensureLineageLedger(file, "root", limits, { allowLimitUpdate: true });
+  const request = (id: string, parentId: string | null, kind: "launch" | "resume" = "launch") => ({
+    id, parentId, name: id, agent: null, depth: parentId ? 2 : 1,
+    sessionFile: `${id}.jsonl`, activityFile: activityFile(file, id), ownerPid: process.pid, task: "test", kind,
+  });
+  for (const id of ["p1", "p2", "p3"]) await reserveLineageLaunch(file, request(id, null));
+  const outcomes = await Promise.allSettled(["a", "b", "c"].map(id => reserveLineageLaunch(file, request(id, "p1"))));
+  assert.equal(outcomes.filter(r => r.status === "fulfilled").length, 2);
+  assert.match(String((outcomes.find(r => r.status === "rejected") as PromiseRejectedResult).reason), /child.*limit/i);
+  const lease = (outcomes.find(r => r.status === "fulfilled") as PromiseFulfilledResult<any>).value;
+  await releaseLineageLaunch(file, lease.id, lease.token);
+  await reserveLineageLaunch(file, request("replacement", "p1"));
+  await ensureLineageLedger(file, "root", { ...limits, maxConcurrentChildren: 99 }, { allowLimitUpdate: false });
+  assert.equal(readLineageLedger(file)!.limits.maxConcurrentChildren, 2);
+  const before = readFileSync(file, "utf8");
+  await assert.rejects(reserveLineageLaunch(file, request(lease.id, "p1", "resume")), /child.*limit/i);
+  assert.equal(readFileSync(file, "utf8"), before);
+  await reserveLineageLaunch(file, request("other-project", "p2"));
+  await assert.rejects(reserveLineageLaunch(file, request("global-full", "p3")), /descendant limit/i);
+});

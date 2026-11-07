@@ -155,7 +155,7 @@ Every launch asks the child to finish with a concise `## Handoff` footer contain
 | **researcher** | `openai-codex/gpt-5.6-luna` | `max` | `read`, `safe_bash` | Web research through sandboxed HTTP/search commands, synthesized into a sourced brief |
 | **worker** | `openai-codex/gpt-5.6-sol` | `high` | `read`, `write`, `edit`, `bash` + spawning | General implementer; may spawn `scout` and `researcher` |
 
-All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). For reserved worker tasks, `useAstraXhigh: true` requests `openai-codex/gpt-6-astra` at `xhigh`; the extension always asks the user before activation, including on resume, and refuses when interactive confirmation is unavailable.
+All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). For reserved worker tasks, `useAstraXhigh: true` requests `openai/gpt-6-astra` at `xhigh`; the extension always asks the user before activation, including on resume, and refuses when interactive confirmation is unavailable. Native `openai/gpt-6-astra`, historical `openai-codex/gpt-6-astra`, and bare `gpt-6-astra` remain guarded aliases. Historical saved model IDs are replayed unchanged on resume, and the confirmation names the actual saved model.
 
 ## Custom agents
 
@@ -188,7 +188,8 @@ You are a specialized agent that does X...
 | `thinking` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child; if a declared extension is unavailable, spawning fails with a diagnostic instead of silently granting an incomplete loadout |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
-| `skills` | string or boolean | Comma-separated skill names to load, or `false` to disable skill discovery |
+| `skills` | string or boolean | Comma-separated personal skill names to bootstrap explicitly, or `false` to disable skills |
+| `skill_catalog` | string | Comma-separated personal skill names to advertise for selective reading, without bootstrap expansion |
 | `extensions` | boolean | `false` disables optional extension discovery |
 | `allowed_subagents` | string | `none` disables nested delegation |
 | `prompt_mode` | string | `append` or `replace`, compatible with the managed harness profiles |
@@ -301,6 +302,62 @@ The installed harness uses this policy:
 ```
 
 `maxLaunchesPerLineage: null` explicitly means there is no cumulative process-launch policy cap. A non-negative integer retains the finite-cap behavior used by older version-one configs and ledgers. Depth and active-descendant limits remain finite. The existing 10,000-record bound on distinct persisted descendant identities remains a metadata resource guard: at capacity a new identity is rejected before mutation, while an existing identity can still resume and increment its accounting.
+
+### Optional two-level coordination limit
+
+`delegation.maxConcurrentChildren` is an optional integer from 0 to 10,000. It caps active immediate children **per non-root parent**, not the root's direct children. Reservations (including children not yet spawned) and resumes count under the same ledger lock as the global descendant/depth checks. Releasing a lease frees capacity; it does not reset launch accounting. Inherited processes use the root ledger's policy and cannot override it. Existing version-one ledgers without this field retain their previous behavior.
+
+For a future depth-two policy, the root can explicitly configure `maxDepth: 2`, `maxConcurrentDescendants: 6`, and `maxConcurrentChildren: 2`. This runtime change does not install or activate that policy. Existing root-authorized policy updates remain supported; descendants cannot change limits.
+
+### Selective personal skills
+
+Restricted Pi profiles now disable automatic skill discovery. `skills: name-one, name-two` (or the existing singular `skill` alias) selects only those personal skills, while preserving the existing named bootstrap messages. `skills: false` still disables all skills. An omitted selection, or `skills: true`, does not grant discovery to a restricted profile. Intentionally unrestricted launches without a named selection retain their previous discovery behavior.
+
+A named skill must be a valid `<name>/SKILL.md` under the personal `PI_CODING_AGENT_DIR/skills` (default `~/.pi/agent/skills`) or `~/.agents/skills`, in that order. Names use lowercase letters, numbers and single hyphens, up to 64 characters. Missing, malformed, mismatched-name and escaping symlink selections fail closed before child creation; project/cwd skill directories and package/settings discovery are not consulted. Invalid higher-priority selections do not fall back to another location.
+
+The loadout saves the skill policy and explicit paths. Launch/resume passes `--no-skills` plus one supported Pi `--skill <file>` per selected skill, and resume revalidates the saved paths rather than selecting from a changed profile. Files are not content-pinned: edits to an approved personal skill are visible on resume. Missing/malformed snapshots still refuse resume; legacy restricted snapshots without skill metadata resume with discovery disabled and no selected skills. Tool-extension permissions remain controlled by the existing tool allowlist, not by skills.
+
+`skill_catalog: name-one, name-two` advertises selected personal skills through Pi's normal name/description/path listing, without adding their procedures to the task. It uses the same personal-only resolution and validation as `skills`. Catalog-only profiles need not set `skills`. The loadout keeps bootstrap paths in `skillPaths` and catalog paths separately in `skillCatalogPaths`; the deduplicated union is passed with explicit `--skill` flags, but only `skills` produces bootstrap messages. A name present in both lists is explicitly bootstrapped. Legacy snapshots without `skillCatalogPaths` have an empty catalog.
+
+`skills: false` conflicts with a declared `skill_catalog` and is rejected. A catalog entry with `disable-model-invocation: true` is rejected rather than silently hidden from the model. Catalogs do not grant tools or read files on behalf of the model: an allowed read tool is still needed to fetch a procedure. Resume uses saved paths, not edited profile declarations; missing or invalid saved catalog files fail closed just like bootstrap files. Descriptions and bodies remain file-backed, not content-pinned.
+
+Offline regression coverage exercises selection, project-shadow exclusion, invalid/missing skills, escaping symlinks, saved-loadout replay, legacy fail-closed behavior, and the SDK resource loader with discovery disabled. Pi 1.5 CLI parsing and resource-loader source confirm `--no-skills` permits explicitly supplied `--skill` paths. `test/integration/selective-skills-tui.test.ts` additionally runs real offline Pi TUI launch/resume with a synthetic provider: it verifies explicit bootstrap, catalog descriptions/paths without procedure expansion, one selective read, malicious trusted-cwd skill exclusion, snapshot preservation after profile edits, and refusal when a selected catalog file disappears. Set `PI_TEST_CLI` to the installed Pi 1.5 `dist/cli.js` to enable it; no credentials are used.
+
+### Persisted extension bindings and nested lookup
+
+New restricted Pi loadouts save two optional fields together:
+
+```ts
+extensionBindings?: Record<string, string>; // tool name -> absolute existing backing file
+extensionBindingProfiles?: Record<string, {
+  toolAllowlist: string;
+  spawnable: string[];
+}>;
+```
+
+The flat binding map contains exactly the custom tools needed by the child's own `toolAllowlist` and the reachable closure of its permitted spawnable profiles. Built-in, lifecycle/control and route-selector names are reserved and cannot appear as binding keys. The profile map pins tool/spawn ceilings for that closure; unrelated ambient registrations are excluded. Every snapshotted descendant needs an explicit non-null tool scope and must use Pi. A later profile edit may narrow its scope, but adding tools or spawn targets—including making a formerly non-delegating specialist delegate—is refused before launch. Resume checks the saved scope and preserves its exact backing paths, not replacement ambient registrations.
+
+Only paths required by the current child's own tools receive `-e`. Descendant mappings enable lookup, not current tool permissions, and propagating a mapping never executes its module. Global extension discovery remains disabled. A missing backing file anywhere in the saved closure fails closed; there is no ambient substitution for an explicit snapshot, even an empty one.
+
+At `session_start`, restoration reads the existing `PI_SUBAGENT_SESSION` sidecar only after its path matches the actual SDK session, its saved agent/config directory matches the child identity/config, and its session/agent/depth/id matches an active record in the inherited root lineage. Invalid restoration also blocks later binding lookup/dispatch. There is no additional environment authorization list. This is a runtime permission contract, not an OS sandbox against an actor who can edit all of the same user's session/ledger files. Backing file contents are not hashed or pinned.
+
+Both binding fields absent means a legacy loadout: existing own-tool allowlist replay remains supported with its previous per-tool resolution, but the child gains no inherited registry or descendant scope from current ambient registrations. Both fields present means explicit scope; empty maps are not legacy. A legacy coordinator needs a fresh launch to obtain validated descendant bindings.
+
+Names in binding maps/scopes are 1–100 ASCII letters/digits/underscores/hyphens, starting with a letter; prototype-related names are rejected. Limits are 256 bindings, 100 profiles, 256 tools per allowlist, 8,192 characters per allowlist, 32,768 per path, and 48 KiB for the serialized pair of maps (within the existing 64 KiB sidecar bound). Malformed scopes, relative paths, reserved keys, missing mappings and mappings outside the saved scope are rejected. Root-owned depth/global/per-parent ledger limits remain independent and authoritative.
+
+The existing shared registration API is unchanged:
+
+```ts
+const registry = globalThis[Symbol.for("pi.subagents.tool-extension-registry")];
+registry.registerToolExtension(toolName, absoluteExistingBackingFile);
+registry.capabilities; // frozen object on the frozen registry:
+// { version: 1, personalSkillCatalog: true,
+//   perParentChildLimit: true, persistedExtensionBindings: true }
+```
+
+Hosts can require these exact feature markers before dispatching new coordinating profiles, failing closed with restart/upgrade guidance when an old loaded runtime lacks them. This does not add a tool, import a second runtime, or activate an installed profile.
+
+`test/integration/extension-bindings-tui.test.ts` runs official Pi 1.5 TUI coordinator → specialist launches and coordinator resumes using an isolated faux provider, with depth 2 / global 6 / per-parent 2. It checks own versus descendant extension loading, exclusion of unrelated/global extensions, specialist non-delegation, tool/spawn profile ceilings, saved mappings and missing dependencies. `test/extension-bindings.test.ts` additionally checks ambient-path replacement versus saved-path replay, malformed/oversized snapshots, forged session/identity/config/lineage contexts, explicit-empty versus legacy fields, and the frozen feature marker.
 
 ## Compatibility and verification
 

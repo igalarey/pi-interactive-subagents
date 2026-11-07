@@ -1,3 +1,4 @@
+import { assertBindingProfileCeiling, assertExtensionBindingFiles, bindingTools, isReservedBindingTool, type ExtensionBindingProfile } from "./extension-bindings.ts";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
@@ -16,6 +17,7 @@ import {
   rmSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { resolvePersonalSkills, validatePersonalSkillPaths } from "./skills.ts";
 import {
   createSurface,
   getSurfaceProcessId,
@@ -202,6 +204,7 @@ interface AgentDefaults {
   model?: string;
   tools?: string;
   skills?: string;
+  skillCatalog?: string;
   disableSkills?: boolean;
   disableExtensions?: boolean;
   maxTurns?: number;
@@ -253,9 +256,10 @@ const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", 
 /** Tool registered by this extension for lightweight route selection. */
 const ROUTING_TOOL = "implementation_route";
 
-const RESERVED_WORKER_MODEL = "openai-codex/gpt-6-astra";
+const RESERVED_WORKER_MODEL = "openai/gpt-6-astra";
 const RESERVED_WORKER_MODEL_ALIASES = new Set([
   RESERVED_WORKER_MODEL,
+  "openai-codex/gpt-6-astra",
   "gpt-6-astra",
 ]);
 
@@ -292,6 +296,7 @@ function isReservedWorkerLoadout(
 async function confirmReservedWorkerEscalation(
   ctx: Pick<ExtensionContext, "hasUI" | "ui"> | undefined,
   task: string | undefined,
+  model = RESERVED_WORKER_MODEL,
 ): Promise<{ approved: true } | { approved: false; message: string }> {
   if (!ctx?.hasUI || typeof ctx.ui?.confirm !== "function") {
     return {
@@ -306,7 +311,7 @@ async function confirmReservedWorkerEscalation(
     const approved = await ctx.ui.confirm(
       "Activate reserved Astra xhigh?",
       [
-        `This worker will use ${RESERVED_WORKER_MODEL} with xhigh thinking.`,
+        `This worker will use ${model} with xhigh thinking.`,
         "It is reserved for exceptional tasks and may use more time or budget.",
         `Task: ${task?.trim() || "(no task provided)"}`,
         "",
@@ -334,9 +339,51 @@ async function confirmReservedWorkerEscalation(
 // `--no-extensions` + an explicit `-e <path>` for it. Mirrors the legacy
 // `subagents` extension's `registerToolExtension` hook.
 const EXTRA_TOOL_EXTENSIONS = new Map<string, string>();
+let inheritedBindingLoadout: SubagentLoadout | null = null;
+let bindingContextReady = false;
+let bindingContextError: Error | null = null;
+
+function assertBindingContext(): void {
+  if (bindingContextError) throw bindingContextError;
+  if (process.env.PI_SUBAGENT_SESSION && !bindingContextReady) throw new Error("Child extension binding context has not been validated");
+}
+
+function restoreExtensionBindings(ctx: { sessionManager: { getSessionFile(): string | null | undefined } }): void {
+  inheritedBindingLoadout = null;
+  bindingContextReady = false;
+  bindingContextError = null;
+  try {
+    const session = process.env.PI_SUBAGENT_SESSION;
+    if (!session) { bindingContextReady = true; return; }
+    const actual = ctx.sessionManager.getSessionFile();
+    if (!actual || !isAbsolute(session) || resolve(session) !== resolve(actual)) throw new Error("Child binding session does not match actual session");
+    const saved = readSubagentLoadout(session);
+    if (!saved || saved.agent !== (process.env.PI_SUBAGENT_AGENT ?? null)) throw new Error("Child binding snapshot identity/agent mismatch");
+    if (!saved.agentDir || realpathSync(saved.agentDir) !== realpathSync(getAgentConfigDir())) throw new Error("Child binding snapshot config directory mismatch");
+    const ledger = process.env.PI_SUBAGENT_LINEAGE_FILE ? readLineageLedger(process.env.PI_SUBAGENT_LINEAGE_FILE) : null;
+    const id = process.env.PI_SUBAGENT_ID;
+    const active = id && ledger?.active[id];
+    if (!ledger || ledger.lineageId !== process.env.PI_SUBAGENT_LINEAGE_ID || !active ||
+        active.agent !== saved.agent || resolve(active.sessionFile) !== resolve(session) ||
+        active.depth !== Number(process.env.PI_SUBAGENT_DEPTH) || active.depth < 1) {
+      throw new Error("Child binding snapshot lacks matching active lineage ownership");
+    }
+    assertExtensionBindingFiles(saved);
+    inheritedBindingLoadout = saved;
+    bindingContextReady = true;
+  } catch (error) {
+    bindingContextError = error instanceof Error ? error : new Error(String(error));
+    throw bindingContextError;
+  }
+}
 
 /** Register (or re-register) a custom tool's backing extension file. */
 export function registerToolExtension(name: string, extensionPath: string): void {
+  if (inheritedBindingLoadout) {
+    const bindings = inheritedBindingLoadout.extensionBindings;
+    if (!bindings || !Object.hasOwn(bindings, name) || bindings[name] !== extensionPath) throw new Error(`Registration would widen inherited extension binding scope: ${name}`);
+    return;
+  }
   if (BUILTIN_TOOLS.has(name)) {
     throw new Error(`Cannot register custom tool "${name}": shadows a built-in pi tool`);
   }
@@ -346,6 +393,7 @@ export function registerToolExtension(name: string, extensionPath: string): void
   if (name === ROUTING_TOOL) {
     throw new Error(`Cannot register custom tool "${name}": shadows the route selector`);
   }
+  assertExtensionBindingFiles({ toolAllowlist: name, spawnable: [], extensionBindings: { [name]: extensionPath }, extensionBindingProfiles: {} });
   const existing = EXTRA_TOOL_EXTENSIONS.get(name);
   if (existing === extensionPath) return; // idempotent / reload-safe
   if (existing !== undefined) {
@@ -359,7 +407,10 @@ export function registerToolExtension(name: string, extensionPath: string): void
 // Expose registration on a process-global so project-local extensions loaded
 // via jiti (separate module instances) can reach this shared map. Set at module
 // load so it's available before any `session_start` listener runs.
-const toolExtensionRegistry = { registerToolExtension };
+const toolExtensionRegistry = Object.freeze({
+  registerToolExtension,
+  capabilities: Object.freeze({ version: 1, personalSkillCatalog: true, perParentChildLimit: true, persistedExtensionBindings: true }),
+});
 (globalThis as any).__pi_interactive_subagents = toolExtensionRegistry;
 (globalThis as any)[Symbol.for("pi.subagents.tool-extension-registry")] = toolExtensionRegistry;
 
@@ -370,10 +421,15 @@ const toolExtensionRegistry = { registerToolExtension };
  * tools and for unknown names (which simply won't be granted).
  */
 function getToolExtensionPath(tool: string): string | undefined {
+  assertBindingContext();
   if (BUILTIN_TOOLS.has(tool)) return undefined;
   // The spawning tools and route selector are registered by THIS extension.
   if ((SPAWNING_TOOLS as readonly string[]).includes(tool) || tool === ROUTING_TOOL) {
     return fileURLToPath(import.meta.url);
+  }
+  if (inheritedBindingLoadout) {
+    const bindings = inheritedBindingLoadout.extensionBindings;
+    return bindings && Object.hasOwn(bindings, tool) ? bindings[tool] : undefined;
   }
   const extBase = join(getAgentConfigDir(), "extensions");
   const map: Record<string, string> = {
@@ -445,6 +501,8 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   const skills = getFrontmatterValue(frontmatter, "skills");
   if (skill && skills && skill !== skills) throw new Error(`Conflicting skill declarations in ${fallbackName}`);
   const effectiveSkills = skill ?? skills;
+  const skillCatalog = getFrontmatterValue(frontmatter, "skill_catalog");
+  if (skillCatalog != null && effectiveSkills === "false") throw new Error(`Conflicting skills:false and skill_catalog in ${fallbackName}`);
   const extensions = getFrontmatterValue(frontmatter, "extensions");
   if (extensions != null && extensions !== "false" && extensions !== "true") throw new Error(`Invalid extensions in ${fallbackName}`);
   const allowed = getFrontmatterValue(frontmatter, "allowed_subagents");
@@ -471,6 +529,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
           ? "append"
           : undefined,
     skills: effectiveSkills === "false" || effectiveSkills === "true" ? undefined : effectiveSkills,
+    skillCatalog,
     disableSkills: effectiveSkills === "false",
     disableExtensions: extensions === "false",
     maxTurns,
@@ -1628,19 +1687,6 @@ function buildSubagentToolAllowlist(
   return [...allow].join(",");
 }
 
-function getMissingToolExtensions(toolAllowlist: string): string[] {
-  const missing = new Set<string>();
-  for (const rawTool of toolAllowlist.split(",")) {
-    const tool = rawTool.trim();
-    // ask_question is loaded separately for every Pi child by the launch and
-    // resume paths, so it is not resolved through the custom-tool map.
-    if (!tool || BUILTIN_TOOLS.has(tool) || SUBAGENT_CONTROL_TOOL_SET.has(tool)) continue;
-    const extPath = getToolExtensionPath(tool);
-    if (!extPath || !existsSync(extPath)) missing.add(tool);
-  }
-  return [...missing];
-}
-
 interface ToolCapabilitySummary {
   restricted: boolean;
   tools: string[] | null;
@@ -1652,10 +1698,11 @@ interface ToolCapabilitySummary {
 interface AgentCapabilitySummary extends ToolCapabilitySummary {
   runtime: "pi" | "claude";
   skills: string[];
+  skillCatalog: string[];
   spawnable: string[];
 }
 
-function resolveToolCapabilities(toolAllowlist: string | null): ToolCapabilitySummary {
+function resolveToolCapabilities(toolAllowlist: string | null, bindings?: Record<string, string>): ToolCapabilitySummary {
   if (!toolAllowlist) {
     return {
       restricted: false,
@@ -1669,9 +1716,13 @@ function resolveToolCapabilities(toolAllowlist: string | null): ToolCapabilitySu
   const tools = [...new Set(toolAllowlist.split(",").map((tool) => tool.trim()).filter(Boolean))];
   const extensionBackedTools: string[] = [];
   const extensionPaths = new Set<string>();
+  const missingExtensions: string[] = [];
   for (const tool of tools) {
     if (BUILTIN_TOOLS.has(tool) || SUBAGENT_CONTROL_TOOL_SET.has(tool)) continue;
-    const extensionPath = getToolExtensionPath(tool);
+    const extensionPath = bindings === undefined ? getToolExtensionPath(tool)
+      : isReservedBindingTool(tool) ? fileURLToPath(import.meta.url)
+      : Object.hasOwn(bindings, tool) ? bindings[tool] : undefined;
+    if (!extensionPath || !existsSync(extensionPath)) missingExtensions.push(tool);
     if (extensionPath) {
       extensionBackedTools.push(tool);
       extensionPaths.add(extensionPath);
@@ -1682,12 +1733,13 @@ function resolveToolCapabilities(toolAllowlist: string | null): ToolCapabilitySu
     restricted: true,
     tools,
     extensionBackedTools,
-    missingExtensions: getMissingToolExtensions(toolAllowlist),
+    missingExtensions,
     extensionPaths: [...extensionPaths],
   };
 }
 
 function resolveAgentCapabilities(agentDefs: AgentDefaults | null): AgentCapabilitySummary {
+  assertBindingContext();
   const runtime = agentDefs?.cli === "claude" ? "claude" : "pi";
   const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
   const toolAllowlist = runtime === "pi"
@@ -1697,6 +1749,7 @@ function resolveAgentCapabilities(agentDefs: AgentDefaults | null): AgentCapabil
     ...resolveToolCapabilities(toolAllowlist),
     runtime,
     skills: parseCommaList(agentDefs?.skills) ?? [],
+    skillCatalog: parseCommaList(agentDefs?.skillCatalog) ?? [],
     spawnable: agentDefs?.subagentAgents ?? [],
   };
 }
@@ -1709,8 +1762,61 @@ function capabilityDetails(capabilities: AgentCapabilitySummary) {
     missingExtensions: capabilities.missingExtensions,
     runtime: capabilities.runtime,
     skills: capabilities.skills,
+    skillCatalog: capabilities.skillCatalog,
     spawnable: capabilities.spawnable,
   };
+}
+
+function createExtensionBindingSnapshot(agent: string | null, defs: AgentDefaults | null, toolAllowlist: string | null): Pick<SubagentLoadout, "extensionBindings" | "extensionBindingProfiles"> {
+  assertBindingContext();
+  if (toolAllowlist === null) {
+    if (inheritedBindingLoadout) throw new Error("Unrestricted child would widen inherited binding scope");
+    return {};
+  }
+  const ownScope = { toolAllowlist, spawnable: defs?.subagentAgents ?? [] };
+  if (inheritedBindingLoadout) {
+    if (!agent || !inheritedBindingLoadout.spawnable?.includes(agent)) throw new Error("Launch target is outside inherited binding scope");
+    assertBindingProfileCeiling(agent, ownScope, inheritedBindingLoadout.extensionBindingProfiles ?? {});
+  }
+  const profiles: Record<string, ExtensionBindingProfile> = Object.create(null);
+  const bindings: Record<string, string> = Object.create(null);
+  const needed = new Set(bindingTools(toolAllowlist));
+  const queue = [...ownScope.spawnable];
+  while (queue.length) {
+    const name = queue.shift()!;
+    if (Object.hasOwn(profiles, name)) continue;
+    if (Object.keys(profiles).length >= 100) throw new Error("Extension binding profile closure exceeds 100 profiles");
+    const profile = loadAgentDefaults(name);
+    if (!profile || profile.cli === "claude") throw new Error(`Missing or unsupported binding profile: ${name}`);
+    const tools = buildSubagentToolAllowlist(profile.tools, { grantSpawning: !!profile.subagentAgents?.length });
+    if (tools === null) throw new Error(`Unrestricted binding profile scope is not supported: ${name}`);
+    const scope = { toolAllowlist: tools, spawnable: profile.subagentAgents ?? [] };
+    if (inheritedBindingLoadout) assertBindingProfileCeiling(name, scope, inheritedBindingLoadout.extensionBindingProfiles ?? {});
+    profiles[name] = scope;
+    bindingTools(tools).forEach(tool => needed.add(tool));
+    queue.push(...scope.spawnable);
+  }
+  for (const tool of needed) {
+    if (isReservedBindingTool(tool)) continue;
+    const path = getToolExtensionPath(tool);
+    if (!path) throw new Error(`Missing extension binding backing file for tool: ${tool}`);
+    bindings[tool] = path;
+  }
+  const result = { extensionBindings: bindings, extensionBindingProfiles: profiles };
+  assertExtensionBindingFiles({ ...ownScope, ...result });
+  return result;
+}
+
+function assertResumeBindingCeiling(loadout: SubagentLoadout): void {
+  assertBindingContext();
+  assertExtensionBindingFiles(loadout);
+  if (!inheritedBindingLoadout) return;
+  if (loadout.toolAllowlist === null || !loadout.agent || !inheritedBindingLoadout.spawnable?.includes(loadout.agent)) throw new Error("Resume would widen inherited binding scope");
+  assertBindingProfileCeiling(loadout.agent ?? "", { toolAllowlist: loadout.toolAllowlist, spawnable: loadout.spawnable ?? [] }, inheritedBindingLoadout.extensionBindingProfiles ?? {});
+  for (const [name, scope] of Object.entries(loadout.extensionBindingProfiles ?? {})) assertBindingProfileCeiling(name, scope, inheritedBindingLoadout.extensionBindingProfiles ?? {});
+  for (const [tool, path] of Object.entries(loadout.extensionBindings ?? {})) {
+    if (inheritedBindingLoadout.extensionBindings?.[tool] !== path) throw new Error(`Resume would replace inherited binding: ${tool}`);
+  }
 }
 
 function assertToolExtensionsAvailable(toolAllowlist: string | null): void {
@@ -1740,7 +1846,13 @@ function applySandboxToParts(
   opts: { artifactDir: string; name: string },
 ): void {
   parts.unshift(`PI_SUBAGENT_MAX_TURNS=${shellEscape(loadout.maxTurns == null ? "" : String(loadout.maxTurns))}`);
-  if (loadout.disableSkills) parts.push("--no-skills");
+  if (loadout.disableSkills || loadout.disableExtensions || loadout.toolAllowlist || loadout.skillPolicy === "personal-named") parts.push("--no-skills");
+  if (loadout.skillPolicy === "personal-named") {
+    if (!loadout.skillPaths || !loadout.agentDir) throw new Error("Named skill snapshot is incomplete");
+    validatePersonalSkillPaths(loadout.skillPaths, loadout.agentDir);
+    validatePersonalSkillPaths(loadout.skillCatalogPaths ?? [], loadout.agentDir, { catalog: true });
+    for (const path of new Set([...loadout.skillPaths, ...(loadout.skillCatalogPaths ?? [])])) parts.push("--skill", shellEscape(path));
+  }
   if (loadout.disableExtensions && !loadout.toolAllowlist) parts.push("--no-extensions");
   if (loadout.model) {
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
@@ -1766,12 +1878,19 @@ function applySandboxToParts(
   // extensions backing the whitelisted tools. A null allowlist means the spawn
   // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
   if (loadout.toolAllowlist) {
-    assertToolExtensionsAvailable(loadout.toolAllowlist);
+    assertResumeBindingCeiling(loadout);
+    if (loadout.extensionBindings === undefined) assertToolExtensionsAvailable(loadout.toolAllowlist);
     parts.push("--no-extensions");
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
 
-    const capabilities = resolveToolCapabilities(loadout.toolAllowlist);
-    for (const extPath of capabilities.extensionPaths) {
+    const paths = loadout.extensionBindings === undefined
+      ? resolveToolCapabilities(loadout.toolAllowlist).extensionPaths
+      : bindingTools(loadout.toolAllowlist).flatMap(tool => {
+          if (BUILTIN_TOOLS.has(tool) || SUBAGENT_CONTROL_TOOL_SET.has(tool)) return [];
+          if (isReservedBindingTool(tool)) return [fileURLToPath(import.meta.url)];
+          return [loadout.extensionBindings![tool]];
+        });
+    for (const extPath of new Set(paths)) {
       parts.push("-e", shellEscape(extPath));
     }
   }
@@ -2029,6 +2148,7 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 }
 
 export const __test__ = {
+  restoreExtensionBindings,
   borderLine,
   renderSubagentWidgetLines,
   formatLineageLaunchUsage,
@@ -2131,6 +2251,11 @@ async function launchSubagentImpl(
   const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
   const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
   const capabilities = resolveAgentCapabilities(agentDefs);
+  const bindingSnapshot = agentDefs?.cli === "claude" ? {} : createExtensionBindingSnapshot(params.agent ?? null, agentDefs, toolAllowlist);
+  const skillPaths = agentDefs?.cli === "claude" ? [] : resolvePersonalSkills(effectiveSkills, getAgentConfigDir());
+  const skillCatalogPaths = agentDefs?.cli === "claude" ? [] : resolvePersonalSkills(agentDefs?.skillCatalog, getAgentConfigDir(), { catalog: true });
+  const skillPolicy = agentDefs?.disableSkills ? "disabled"
+    : toolAllowlist || agentDefs?.disableExtensions || effectiveSkills || agentDefs?.skillCatalog ? "personal-named" : "unrestricted";
 
   // Validate before creating a session, surface, or sandbox artifacts. Claude
   // launches do not use the Pi extension allowlist, so they are exempt.
@@ -2319,9 +2444,13 @@ async function launchSubagentImpl(
   // `subagent_message({ name })` resume can replay the exact same
   // restriction instead of relaunching pi with all global extensions + tools.
   const loadout: SubagentLoadout = {
+    ...bindingSnapshot,
     agent: params.agent ?? null,
     toolAllowlist,
-    disableSkills: agentDefs?.disableSkills ?? false,
+    disableSkills: skillPolicy !== "unrestricted",
+    skillPolicy,
+    skillPaths,
+    skillCatalogPaths,
     disableExtensions: agentDefs?.disableExtensions ?? false,
     maxTurns: agentDefs?.maxTurns,
     model: effectiveModel ?? null,
@@ -2774,6 +2903,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
   // Capture the UI context for widget updates
   pi.on("session_start", async (_event, ctx) => {
+    restoreExtensionBindings(ctx);
     sessionGeneration += 1;
     latestUiGeneration += 1;
     sessionActive = true;
@@ -3277,12 +3407,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const desc = a.description ? ` — ${a.description}` : "";
           const model = a.model ? ` [${a.model}]` : "";
           const tools = a.capabilities.tools === null ? "default" : a.capabilities.tools.join(",") || "none";
+          const catalog = a.capabilities.skillCatalog.join(",") || "none";
           const skills = a.capabilities.skills.length > 0 ? a.capabilities.skills.join(",") : "none";
           const spawns = a.capabilities.spawnable.length > 0 ? a.capabilities.spawnable.join(",") : "none";
           const missing = a.capabilities.missingExtensions.length > 0
             ? `; missing extensions: ${a.capabilities.missingExtensions.join(",")}`
             : "";
-          return `• ${a.name}${badge}${model}${desc}\n  capabilities: runtime=${a.capabilities.runtime}; tools=${tools}; skills=${skills}; spawns=${spawns}${missing}`;
+          return `• ${a.name}${badge}${model}${desc}\n  capabilities: runtime=${a.capabilities.runtime}; tools=${tools}; skills=${skills}; skill_catalog=${catalog}; spawns=${spawns}${missing}`;
         });
 
         return {
@@ -3477,6 +3608,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
+        assertResumeBindingCeiling(loadout);
         validateResumeConstraints(loadout, params);
         if (pendingResumes.has(sessionPath)) throw new Error(`Subagent "${name}" is already resuming`);
         pendingResumes.add(sessionPath);
@@ -3486,7 +3618,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const resumeGeneration = sessionGeneration;
         try {
         if (isReservedWorkerLoadout(loadout)) {
-          const confirmation = await confirmReservedWorkerEscalation(ctx, message);
+          const confirmation = await confirmReservedWorkerEscalation(ctx, message, loadout.model ?? RESERVED_WORKER_MODEL);
           if (confirmation.approved === false) {
             return {
               content: [{ type: "text" as const, text: confirmation.message }],
@@ -3548,9 +3680,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           throw error;
         }
         const resumedCapabilities: AgentCapabilitySummary = {
-          ...resolveToolCapabilities(loadout.toolAllowlist),
+          ...resolveToolCapabilities(loadout.toolAllowlist, loadout.extensionBindings),
           runtime: "pi",
           skills: [],
+          skillCatalog: [],
           spawnable: loadout.spawnable ?? [],
         };
 

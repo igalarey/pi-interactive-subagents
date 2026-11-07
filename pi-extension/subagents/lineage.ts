@@ -16,6 +16,7 @@ import { sanitizeMonitorText } from "./monitor.ts";
 export interface DelegationLimits {
   maxDepth: number;
   maxConcurrentDescendants: number;
+  maxConcurrentChildren?: number;
   maxLaunchesPerLineage: number | null;
 }
 
@@ -127,7 +128,7 @@ export function validateDelegationLimits(value: unknown): DelegationLimits {
     throw new Error("delegation limits must be an object");
   }
   const input = value as Record<string, unknown>;
-  const keys = ["maxDepth", "maxConcurrentDescendants", "maxLaunchesPerLineage"];
+  const keys = ["maxDepth", "maxConcurrentDescendants", "maxConcurrentChildren", "maxLaunchesPerLineage"];
   const extra = Object.keys(input).filter((key) => !keys.includes(key));
   if (extra.length) throw new Error(`delegation limits have unsupported key(s): ${extra.join(", ")}`);
   for (const key of ["maxDepth", "maxConcurrentDescendants"] as const) {
@@ -136,7 +137,11 @@ export function validateDelegationLimits(value: unknown): DelegationLimits {
   if (input.maxLaunchesPerLineage !== null && !validLimit(input.maxLaunchesPerLineage)) {
     throw new Error(`delegation.maxLaunchesPerLineage must be null or an integer from 0 to ${MAX_RECORDS}`);
   }
+  if (Object.hasOwn(input, "maxConcurrentChildren") && !validLimit(input.maxConcurrentChildren)) {
+    throw new Error(`delegation.maxConcurrentChildren must be an integer from 0 to ${MAX_RECORDS}`);
+  }
   return {
+    ...(input.maxConcurrentChildren === undefined ? {} : { maxConcurrentChildren: input.maxConcurrentChildren as number }),
     maxDepth: input.maxDepth as number,
     maxConcurrentDescendants: input.maxConcurrentDescendants as number,
     maxLaunchesPerLineage: input.maxLaunchesPerLineage as number | null,
@@ -452,6 +457,11 @@ export async function reserveLineageLaunch(
         "Wait for or cancel an active descendant before launching another. Stale owners are reclaimed only after confirmed process death; " +
         "platforms without process-start identity conservatively retain an apparently live PID to avoid a PID-reuse race.",
       );
+    }
+    const childLimit = ledger.limits.maxConcurrentChildren;
+    if (parentId !== null && childLimit !== undefined &&
+        Object.values(ledger.active).filter(record => record.parentId === parentId).length >= childLimit) {
+      throw new Error(`Subagent concurrent child limit reached (${childLimit} active children for parent ${parentId}).`);
     }
     const launchLimit = ledger.limits.maxLaunchesPerLineage;
     if (launchLimit !== null && ledger.launchesUsed >= launchLimit) {
