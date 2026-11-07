@@ -3,6 +3,8 @@ import { writeFileSync, appendFileSync, existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 export default async function (pi: ExtensionAPI) {
+  // An isolated HOME makes host ancestor skills look project-local; never trust them.
+  pi.on("project_trust", () => ({ trusted: "no", remember: false }));
   const { fauxProvider, fauxAssistantMessage, fauxToolCall } = await import(pathToFileURL(process.env.PI_TEST_FAUX!).href);
   const faux = fauxProvider({ provider: "interactive-faux", models: [{ id: "local" }] });
   if (process.env.PI_TEST_POLICY) {
