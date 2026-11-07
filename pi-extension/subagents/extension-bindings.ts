@@ -6,6 +6,7 @@ export interface ExtensionBindingProfile {
   spawnable: string[];
 }
 export interface ExtensionBindingSnapshot {
+  extensionPolicy?: "scoped";
   extensionBindings?: Record<string, string>;
   extensionBindingProfiles?: Record<string, ExtensionBindingProfile>;
   toolAllowlist: string | null;
@@ -29,6 +30,8 @@ function validProfiles(value: unknown): value is string[] {
 
 export function validateExtensionBindingSnapshot(input: ExtensionBindingSnapshot): void {
   const bindings = input.extensionBindings, profiles = input.extensionBindingProfiles;
+  if (input.extensionPolicy !== undefined && input.extensionPolicy !== 'scoped') throw new Error('Invalid extension binding policy');
+  if (input.extensionPolicy === 'scoped' && (bindings === undefined || profiles === undefined)) throw new Error('Scoped extension policy requires explicit binding snapshots');
   if (bindings === undefined && profiles === undefined) return;
   if (!object(bindings) || !object(profiles) || !validTools(input.toolAllowlist) || !validProfiles(input.spawnable ?? [])) throw new Error('Invalid extension binding snapshot scope');
   if (Object.keys(bindings).length > 256 || Object.keys(profiles).length > 100 || Buffer.byteLength(JSON.stringify([bindings, profiles])) > 48 * 1024) throw new Error('Extension binding snapshot exceeds bounds');

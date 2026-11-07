@@ -207,6 +207,7 @@ interface AgentDefaults {
   skillCatalog?: string;
   disableSkills?: boolean;
   disableExtensions?: boolean;
+  extensionPolicy?: "scoped";
   maxTurns?: number;
   thinking?: string;
   /**
@@ -409,7 +410,7 @@ export function registerToolExtension(name: string, extensionPath: string): void
 // load so it's available before any `session_start` listener runs.
 const toolExtensionRegistry = Object.freeze({
   registerToolExtension,
-  capabilities: Object.freeze({ version: 1, personalSkillCatalog: true, perParentChildLimit: true, persistedExtensionBindings: true }),
+  capabilities: Object.freeze({ version: 1, personalSkillCatalog: true, perParentChildLimit: true, persistedExtensionBindings: true, scopedExtensionProfiles: true }),
 });
 (globalThis as any).__pi_interactive_subagents = toolExtensionRegistry;
 (globalThis as any)[Symbol.for("pi.subagents.tool-extension-registry")] = toolExtensionRegistry;
@@ -504,11 +505,13 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   const skillCatalog = getFrontmatterValue(frontmatter, "skill_catalog");
   if (skillCatalog != null && effectiveSkills === "false") throw new Error(`Conflicting skills:false and skill_catalog in ${fallbackName}`);
   const extensions = getFrontmatterValue(frontmatter, "extensions");
-  if (extensions != null && extensions !== "false" && extensions !== "true") throw new Error(`Invalid extensions in ${fallbackName}`);
+  if (extensions != null && extensions !== "false" && extensions !== "true" && extensions !== "scoped") throw new Error(`Invalid extensions in ${fallbackName}`);
   const allowed = getFrontmatterValue(frontmatter, "allowed_subagents");
   if (allowed != null && allowed !== "none") throw new Error(`Unsupported allowed_subagents in ${fallbackName}`);
   const declaredTools = getFrontmatterValue(frontmatter, "tools");
   const requestedTools = parseCommaList(declaredTools) ?? [];
+  if (extensions === "scoped" && requestedTools.length === 0) throw new Error(`extensions:scoped requires explicit nonempty tools in ${fallbackName}`);
+  if (extensions === "scoped" && getFrontmatterValue(frontmatter, "cli") === "claude") throw new Error(`extensions:scoped requires the Pi runtime in ${fallbackName}`);
   if (allowed === "none" && requestedTools.some(tool => (SPAWNING_TOOLS as readonly string[]).includes(tool))) throw new Error(`Conflicting spawning tools in ${fallbackName}`);
   if (extensions === "false" && requestedTools.some(tool => !BUILTIN_TOOLS.has(tool) && !SUBAGENT_CONTROL_TOOL_SET.has(tool))) throw new Error(`extensions:false forbids extension-backed tools in ${fallbackName}`);
   const spawnable = parseCommaList(getFrontmatterValue(frontmatter, "subagent_agents"));
@@ -532,6 +535,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     skillCatalog,
     disableSkills: effectiveSkills === "false",
     disableExtensions: extensions === "false",
+    extensionPolicy: extensions === "scoped" ? "scoped" : undefined,
     maxTurns,
     thinking: getFrontmatterValue(frontmatter, "thinking"),
     subagentAgents: allowed === "none" ? [] : spawnable,
@@ -1845,6 +1849,7 @@ function applySandboxToParts(
   loadout: SubagentLoadout,
   opts: { artifactDir: string; name: string },
 ): void {
+  assertExtensionBindingFiles(loadout);
   parts.unshift(`PI_SUBAGENT_MAX_TURNS=${shellEscape(loadout.maxTurns == null ? "" : String(loadout.maxTurns))}`);
   if (loadout.disableSkills || loadout.disableExtensions || loadout.toolAllowlist || loadout.skillPolicy === "personal-named") parts.push("--no-skills");
   if (loadout.skillPolicy === "personal-named") {
@@ -2452,6 +2457,7 @@ async function launchSubagentImpl(
     skillPaths,
     skillCatalogPaths,
     disableExtensions: agentDefs?.disableExtensions ?? false,
+    extensionPolicy: agentDefs?.extensionPolicy,
     maxTurns: agentDefs?.maxTurns,
     model: effectiveModel ?? null,
     thinking: effectiveThinking ?? null,

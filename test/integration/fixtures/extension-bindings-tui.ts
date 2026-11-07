@@ -12,9 +12,9 @@ function backing(name: string) {
 }
 const own = backing('own_tool'), specialist = backing('specialist_tool'), unrelated = backing('unrelated_tool');
 const specialistFile = join(env.agentDir, 'agents', 'specialist.md');
-const specialistProfile = (extra = '') => `---\nname: specialist\nmodel: bindings-faux/local\ntools: read, specialist_tool${extra === 'tool' ? ', unrelated_tool' : ''}\nskills: false\nauto-exit: true\n${extra === 'spawn' ? 'subagent_agents: coordinator\n' : ''}---\nSpecialist fixture`;
+const specialistProfile = (extra = '') => `---\nname: specialist\nmodel: bindings-faux/local\nextensions: scoped\ntools: read, specialist_tool${extra === 'tool' ? ', unrelated_tool' : ''}\nskills: false\nauto-exit: true\n${extra === 'spawn' ? 'subagent_agents: coordinator\n' : ''}---\nSpecialist fixture`;
 writeFileSync(specialistFile, specialistProfile());
-writeFileSync(join(env.agentDir, 'agents', 'coordinator.md'), '---\nname: coordinator\nmodel: bindings-faux/local\ntools: read, own_tool\nsubagent_agents: specialist\nskills: false\nauto-exit: true\n---\nCoordinator fixture');
+writeFileSync(join(env.agentDir, 'agents', 'coordinator.md'), '---\nname: coordinator\nmodel: bindings-faux/local\nextensions: scoped\ntools: read, own_tool\nsubagent_agents: specialist\nskills: false\nauto-exit: true\n---\nCoordinator fixture');
 writeFileSync(join(env.agentDir, 'subagents.json'), JSON.stringify({ ...JSON.parse(readFileSync(resolve('config.json.example'), 'utf8')), surfaceBackend: 'process', includeBundledAgents: false, allowProjectAgents: false, requireProfile: true, delegation: { maxDepth: 2, maxConcurrentDescendants: 6, maxConcurrentChildren: 2, maxLaunchesPerLineage: null } }));
 mkdirSync(join(env.agentDir, 'extensions'), { recursive: true });
 writeFileSync(join(env.agentDir, 'extensions', 'ambient.ts'), `export default function() { throw new Error('GLOBAL_EXTENSION_MUST_NOT_LOAD'); }`);
@@ -35,6 +35,7 @@ try {
   assert.equal(done.message.details.exitCode, 0, JSON.stringify(done));
   assert.ok(captures().some(row => row.role === 'specialist'), `real nested specialist must start: ${JSON.stringify(captures())}`);
   const snapshot = JSON.parse(readFileSync(`${first.details.sessionFile}.loadout.json`, 'utf8'));
+  assert.equal(snapshot.extensionPolicy, 'scoped');
   assert.deepEqual(snapshot.extensionBindings, { own_tool: own, specialist_tool: specialist });
   assert.deepEqual(snapshot.extensionBindingProfiles, { specialist: { toolAllowlist: 'read,specialist_tool,ask_question', spawnable: [] } });
   const script = readFileSync(first.details.launchScriptFile, 'utf8');

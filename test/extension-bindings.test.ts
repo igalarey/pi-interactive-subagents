@@ -76,7 +76,24 @@ test('restore requires actual child session, saved identity/config and active li
 test('shared registry advertises frozen verified runtime capabilities without another entrypoint', () => {
   const registry = (globalThis as any)[Symbol.for('pi.subagents.tool-extension-registry')];
   assert.equal(typeof registry.registerToolExtension, 'function');
-  assert.deepEqual(registry.capabilities, { version: 1, personalSkillCatalog: true, perParentChildLimit: true, persistedExtensionBindings: true });
+  assert.deepEqual(registry.capabilities, { version: 1, personalSkillCatalog: true, perParentChildLimit: true, persistedExtensionBindings: true, scopedExtensionProfiles: true });
   assert.ok(Object.isFrozen(registry.capabilities));
   assert.ok(Object.isFrozen(registry));
+});
+
+test('scoped snapshots require explicit nonempty scope and binding maps, never legacy fallback', () => {
+  const session = join(homedir(), 'scoped.jsonl');
+  const scoped = { ...base, toolAllowlist: 'read', spawnable: [], extensionPolicy: 'scoped', extensionBindings: {}, extensionBindingProfiles: {} };
+  writeFileSync(`${session}.loadout.json`, JSON.stringify(scoped));
+  assert.deepEqual(readSubagentLoadout(session), scoped);
+  for (const mutation of [
+    { extensionBindings: undefined }, { extensionBindingProfiles: undefined },
+    { extensionBindings: undefined, extensionBindingProfiles: undefined },
+    { toolAllowlist: null }, { toolAllowlist: '' }, { extensionPolicy: 'ambient' },
+  ]) {
+    const malformed = { ...scoped, ...mutation };
+    writeFileSync(`${session}.loadout.json`, JSON.stringify(malformed));
+    assert.equal(readSubagentLoadout(session), null);
+    assert.throws(() => __test__.applySandboxToParts([], malformed as any, { artifactDir: homedir(), name: 'scoped' }), /scoped|binding/i);
+  }
 });

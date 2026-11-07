@@ -190,7 +190,7 @@ You are a specialized agent that does X...
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string or boolean | Comma-separated personal skill names to bootstrap explicitly, or `false` to disable skills |
 | `skill_catalog` | string | Comma-separated personal skill names to advertise for selective reading, without bootstrap expansion |
-| `extensions` | boolean | `false` disables optional extension discovery |
+| `extensions` | boolean or `scoped` | `false` disables optional extensions; `scoped` requires explicit tools and binding snapshots, with no ambient discovery |
 | `allowed_subagents` | string | `none` disables nested delegation |
 | `prompt_mode` | string | `append` or `replace`, compatible with the managed harness profiles |
 | `max_turns` | positive integer | Stop incomplete work at this turn limit. A resumed process receives a new budget |
@@ -323,6 +323,16 @@ The loadout saves the skill policy and explicit paths. Launch/resume passes `--n
 
 Offline regression coverage exercises selection, project-shadow exclusion, invalid/missing skills, escaping symlinks, saved-loadout replay, legacy fail-closed behavior, and the SDK resource loader with discovery disabled. Pi 1.5 CLI parsing and resource-loader source confirm `--no-skills` permits explicitly supplied `--skill` paths. `test/integration/selective-skills-tui.test.ts` additionally runs real offline Pi TUI launch/resume with a synthetic provider: it verifies explicit bootstrap, catalog descriptions/paths without procedure expansion, one selective read, malicious trusted-cwd skill exclusion, snapshot preservation after profile edits, and refusal when a selected catalog file disappears. Set `PI_TEST_CLI` to the installed Pi 1.5 `dist/cli.js` to enable it; no credentials are used.
 
+### Scoped profile rollout gate
+
+`extensions: scoped` is a Pi-only, fail-closed profile mode. It requires a nonempty explicit `tools` declaration (implicit defaults from `allowed_subagents: none` do not satisfy it). Optional extension grants come only from declared tools through the validated binding snapshot. A builtins-only scoped profile loads no optional provider; lifecycle/control extensions remain the existing fixed runtime support. Existing `extensions: true` and `extensions: false` semantics are unchanged.
+
+Scoped loadouts persist `extensionPolicy: "scoped"`. Both `extensionBindings` and `extensionBindingProfiles` are mandatory, including explicit empty maps for a builtins-only profile. A missing map or null/empty tool scope invalidates the snapshot; resume never treats it as a legacy loadout or substitutes ambient registrations. Later edits changing a profile to `extensions: true` do not change its saved scoped replay. Catalog selection remains separate from procedure bootstrap.
+
+This syntax also gates old loaded runtimes: the sealed `f049ad72cbc88003f59f5033a5d60a235f62eae5` parser explicitly rejects values other than `true`/`false`. The isolated sealed-source regression verifies the release manifest and copied source hashes, then proves parser and launch refusal under the original managed policy (`requireProfile: true`, `includeBundledAgents: false`, `allowProjectAgents: false`, process backend). It does not claim arbitrary older permissive configurations are safe. The sealed artifact is read-only; the test runs one verified copy in an isolated subprocess, not a duplicate runtime in the real parent.
+
+Run the current scoped TUI regression with `PI_TEST_CLI` set to the installed Pi 1.5 `dist/cli.js`. Enable `test/integration/sealed-scoped-rejection.test.ts` with `PI_TEST_SEALED_SUBAGENTS` set to the original release's `packages/pi-interactive-subagents` directory. Tests use synthetic providers or a launch sentinel, never credentials/live models.
+
 ### Persisted extension bindings and nested lookup
 
 New restricted Pi loadouts save two optional fields together:
@@ -352,7 +362,8 @@ const registry = globalThis[Symbol.for("pi.subagents.tool-extension-registry")];
 registry.registerToolExtension(toolName, absoluteExistingBackingFile);
 registry.capabilities; // frozen object on the frozen registry:
 // { version: 1, personalSkillCatalog: true,
-//   perParentChildLimit: true, persistedExtensionBindings: true }
+//   perParentChildLimit: true, persistedExtensionBindings: true,
+//   scopedExtensionProfiles: true }
 ```
 
 Hosts can require these exact feature markers before dispatching new coordinating profiles, failing closed with restart/upgrade guidance when an old loaded runtime lacks them. This does not add a tool, import a second runtime, or activate an installed profile.

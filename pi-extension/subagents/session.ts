@@ -107,6 +107,7 @@ export interface SubagentLoadout {
   skillPaths?: string[];
   skillCatalogPaths?: string[];
   disableExtensions?: boolean;
+  extensionPolicy?: "scoped";
   maxTurns?: number;
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
@@ -153,7 +154,7 @@ function nullableString(value: unknown): value is string | null {
 function validSubagentLoadout(value: unknown): value is SubagentLoadout {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const input = value as Record<string, unknown>;
-  const optionalKeys = ["disableSkills", "disableExtensions", "maxTurns", "skillPolicy", "skillPaths", "skillCatalogPaths", "extensionBindings", "extensionBindingProfiles"];
+  const optionalKeys = ["disableSkills", "disableExtensions", "maxTurns", "skillPolicy", "skillPaths", "skillCatalogPaths", "extensionBindings", "extensionBindingProfiles", "extensionPolicy"];
   if (Object.keys(input).some(key => !(LOADOUT_KEYS as readonly string[]).includes(key) && !optionalKeys.includes(key))) return false;
   for (const key of ["disableSkills", "disableExtensions"]) {
     if (Object.hasOwn(input, key) && typeof input[key] !== "boolean") return false;
