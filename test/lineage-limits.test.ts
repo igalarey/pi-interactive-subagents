@@ -120,6 +120,7 @@ test("default lineage permits more than twelve sequential launches and resumes",
 
 test("new descendant identity is rejected before a full metadata ledger is mutated", async (t) => {
   const file = fixture(t);
+  await ensureLineageLedger(file, "root", DEFAULT_DELEGATION_LIMITS, { allowLimitUpdate: true });
   seedLedgerAtRecordCapacity(file);
   const before = readFileSync(file, "utf8");
   assert.equal(readLineageLedger(file)!.launchesUsed, 10_000);
@@ -142,6 +143,7 @@ test("new descendant identity is rejected before a full metadata ledger is mutat
 
 test("existing descendant resumes at metadata capacity with cumulative and per-descendant counts above 10000", async (t) => {
   const file = fixture(t);
+  await ensureLineageLedger(file, "root", DEFAULT_DELEGATION_LIMITS, { allowLimitUpdate: true });
   seedLedgerAtRecordCapacity(file, 10_001);
   const seeded = readLineageLedger(file)!;
   assert.equal(seeded.launchesUsed, 20_000);
@@ -364,7 +366,7 @@ test("existing lock is never time-reclaimed or removed by a waiter", async (t) =
   writeFileSync(join(lockDir, "owner.json"), JSON.stringify(owner));
   await assert.rejects(
     ensureLineageLedger(file, "root", DEFAULT_DELEGATION_LIMITS, { allowLimitUpdate: true }),
-    /automatic stale-lock deletion is disabled.*remove the \.lock directory manually/i,
+    /automatic stale-lock deletion is disabled.*never delete/i,
   );
   assert.deepEqual(JSON.parse(readFileSync(join(lockDir, "owner.json"), "utf8")), owner);
 });

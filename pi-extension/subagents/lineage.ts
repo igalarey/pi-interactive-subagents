@@ -12,6 +12,7 @@ import {
 import { dirname, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { sanitizeMonitorText } from "./monitor.ts";
+import { acquireLineageMutex } from "./lineage-mutex.ts";
 
 export interface DelegationLimits {
   maxDepth: number;
@@ -84,7 +85,6 @@ export interface LineageLease {
   launchesUsed: number;
 }
 
-const LOCK_WAIT_MS = 1_000;
 const ABANDONED_ACTIVE_MS = 15_000;
 const MAX_RECORDS = 10_000;
 const MAX_LEDGER_BYTES = 64 * 1024 * 1024;
@@ -282,57 +282,8 @@ export function getProcessInstanceId(pid: number): string | null {
   }
 }
 
-async function acquireLock(file: string): Promise<() => void> {
-  const lockDir = `${file}.lock`;
-  const ownerFile = `${lockDir}/owner.json`;
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  const token = randomBytes(16).toString("hex");
-  mkdirSync(dirname(file), { recursive: true });
-  for (;;) {
-    try {
-      mkdirSync(lockDir);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (Date.now() >= deadline) {
-        let owner = "unknown";
-        try {
-          const parsed = JSON.parse(readBoundedText(ownerFile, 4 * 1024) ?? "null");
-          owner = sanitizeMonitorText(`pid=${parsed?.pid ?? "unknown"} at=${parsed?.at ?? "unknown"}`, 120) || "unknown";
-        } catch {}
-        throw new Error(
-          `Timed out acquiring subagent lineage lock: ${file}. Lock owner: ${owner}. ` +
-          "Automatic stale-lock deletion is disabled to prevent deleting a replacement lock. " +
-          "After confirming every owning Pi process has stopped, remove the .lock directory manually.",
-        );
-      }
-      await new Promise((resolve) => setTimeout(resolve, 15));
-      continue;
-    }
-
-    try {
-      writeFileSync(ownerFile, JSON.stringify({ token, pid: process.pid, at: Date.now() }), { encoding: "utf8", flag: "wx" });
-    } catch (error) {
-      // This process just created the directory and no peer can acquire it.
-      try { rmSync(lockDir, { recursive: true, force: true }); } catch {}
-      throw error;
-    }
-
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      let currentToken: unknown;
-      try { currentToken = JSON.parse(readBoundedText(ownerFile, 4 * 1024) ?? "null")?.token; } catch { return; }
-      if (currentToken !== token) return;
-      // No automatic reclaimer exists, so another library process cannot
-      // replace this directory between token verification and removal.
-      rmSync(lockDir, { recursive: true, force: true });
-    };
-  }
-}
-
-async function withLedger<T>(file: string, mutate: (ledger: LineageLedger | null) => T): Promise<T> {
-  const release = await acquireLock(file);
+async function withLedger<T>(file: string, mutate: (ledger: LineageLedger | null) => T, initialize = false): Promise<T> {
+  const release = await acquireLineageMutex(file, initialize);
   try {
     return mutate(readLineageLedger(file));
   } finally {
@@ -361,6 +312,7 @@ export async function ensureLineageLedger(
 ): Promise<LineageLedger> {
   const validated = validateDelegationLimits(limits);
   if (!isSafeLineageId(lineageId)) throw new Error(`Unsafe subagent lineage id: ${sanitizeMonitorText(lineageId, 200)}`);
+  if (!options.allowLimitUpdate && !existsSync(file)) throw new Error("Inherited subagent lineage ledger is missing; refusing to recreate zeroed accounting");
   return withLedger(file, (existing) => {
     const now = Date.now();
     if (!existing && existsSync(file)) {
@@ -377,7 +329,7 @@ export async function ensureLineageLedger(
     ledger.updatedAt = now;
     writeLedger(file, ledger);
     return ledger;
-  });
+  }, options.allowLimitUpdate);
 }
 
 function reconcileAbandoned(ledger: LineageLedger, now: number): boolean {
