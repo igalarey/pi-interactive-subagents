@@ -1215,7 +1215,8 @@ function syncSubagentStatusWidget(
   getAgents: () => RunningSubagent[],
   onRowClick?: (agent: RunningSubagent) => void,
 ): void {
-  if (getAgents().length === 0) {
+  const backend = process.env.PI_SUBAGENT_SURFACE_BACKEND ?? runtimeConfig.surfaceBackend;
+  if (backend === "herdr" || getAgents().length === 0) {
     if (registration.installed) ui.setWidget("subagent-status", undefined);
     registration.installed = false;
     registration.tui = null;

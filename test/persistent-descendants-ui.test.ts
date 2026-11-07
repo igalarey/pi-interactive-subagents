@@ -251,3 +251,46 @@ test("absolute external config is shared by runtime and status without package m
     /Cannot read PI_SUBAGENTS_CONFIG/i,
   );
 });
+
+test("Herdr backend hides only the summary widget and process fallback can reinstall it", (t) => {
+  const previous = process.env.PI_SUBAGENT_SURFACE_BACKEND;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_SUBAGENT_SURFACE_BACKEND;
+    else process.env.PI_SUBAGENT_SURFACE_BACKEND = previous;
+  });
+  const calls: any[] = [];
+  let renders = 0;
+  const tui = { requestRender() { renders++; } };
+  const ui = { setWidget(key: string, content: any) {
+    calls.push([key, content]);
+    if (typeof content === "function") content(tui);
+  } };
+  const registration = { installed: false, tui: null as typeof tui | null };
+  const agents = () => [agent("child", null, 1)];
+  process.env.PI_SUBAGENT_SURFACE_BACKEND = "herdr";
+  __test__.syncSubagentStatusWidget(ui, registration, agents);
+  __test__.syncSubagentStatusWidget(ui, registration, agents);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(registration, { installed: false, tui: null });
+
+  process.env.PI_SUBAGENT_SURFACE_BACKEND = "process";
+  __test__.syncSubagentStatusWidget(ui, registration, agents);
+  assert.equal(registration.installed, true);
+  assert.equal(typeof calls[0][1], "function");
+  __test__.syncSubagentStatusWidget(ui, registration, agents);
+  assert.equal(renders, 1);
+
+  process.env.PI_SUBAGENT_SURFACE_BACKEND = "herdr";
+  __test__.syncSubagentStatusWidget(ui, registration, agents);
+  __test__.syncSubagentStatusWidget(ui, registration, agents);
+  assert.deepEqual(calls.slice(1), [["subagent-status", undefined]]);
+  assert.deepEqual(registration, { installed: false, tui: null });
+  assert.equal(renders, 1);
+
+  process.env.PI_SUBAGENT_SURFACE_BACKEND = "process";
+  __test__.syncSubagentStatusWidget(ui, registration, agents);
+  assert.equal(registration.installed, true);
+  assert.equal(calls.length, 3);
+  __test__.syncSubagentStatusWidget(ui, registration, () => []);
+  assert.deepEqual(calls[3], ["subagent-status", undefined]);
+});
