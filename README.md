@@ -10,7 +10,8 @@ A private mailbox carries coordinator messages separately from terminal input. T
 
 `subagent()` waits for startup and the bootstrap acknowledgment, then returns without waiting for task completion.
 The process backend captures output beside the launch script. The Herdr backend displays the actual Pi TUI.
-A live widget tracks running children. Completion notifications return results to the parent and trigger a new turn.
+A live widget tracks running children with the process backend. Herdr uses native child panes instead of this summary widget.
+Completion notifications return results to the parent and trigger a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -221,7 +222,9 @@ Notes:
 
 ### interactive
 
-Controls whether `stalled`/`recovered` status transitions send a steer message to the parent session. Defaults to the inverse of `auto-exit`: autonomous agents get stall pings, while explicitly interactive profiles stay quiet and rely on the widget. Set explicitly to override.
+The `interactive` setting controls whether `stalled`/`recovered` status transitions send a steer message to the parent session. The default is the inverse of `auto-exit`. Autonomous agents receive stall notifications. Explicitly interactive profiles stay quiet and rely on the monitor or native child panes.
+
+Set `interactive` explicitly to override the default.
 
 ## Tool access control
 
@@ -266,12 +269,16 @@ Resume rejects a saved non-personal agent directory under this policy.
 
 ## Status widget & configuration
 
+The coordinator summary widget appears only with the process backend. The Herdr backend suppresses this widget, including an existing registration.
+Coordination tools, completion notifications, status snapshots, cancellation and resume remain available.
+
 The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
 Use `/subagents` or `Ctrl+Alt+S` to open a live monitor. It shows the active descendant tree across the whole root lineage, with stable IDs, nesting depth, per-parent active child counts (`↳N`), task, model, current tool, sanitized action, and bounded observable events. Use arrow keys to select and collapse/expand branches. Counts remain visible whenever descendants are active, not only while an agent is waiting. Use `/subagent-log <name>` to inspect recent events for a directly owned running or completed named session. These views do not add monitoring output to the parent model's context. Thinking blocks are deliberately excluded.
 
 ### Historical snapshot viewer
 
+Widget clicks apply only to the process backend.
 The optional snapshot viewer is separate from the native Herdr execution backend.
 It displays snapshots, not an interactive child. The installed harness disables this viewer.
 
@@ -393,6 +400,8 @@ npm run test:integration
 npm run test:smoke
 ```
 
+`test/lineage-mutex.test.ts` covers forced termination at acquisition, ledger mutation and release boundaries. It also covers live-owner exclusion, initialization races, legacy fences, invalid paths and unavailable SQLite.
+
 The integration command runs process-only coverage by default; live model tests remain opt-in. The smoke test loads every extension entry point through Pi's real extension loader and exercises `safe_bash` without invoking a model.
 
 ### Current offline TUI and Herdr verification
@@ -408,6 +417,9 @@ node --test --test-concurrency=1 \
 
 These tests use synthetic providers and isolated configuration, without account credentials or paid model calls.
 They cover multiline delivery, owned results, restrictive resume, pending-resume status, and disposal.
+
+The interactive fixture denies project trust without saving the decision. An isolated HOME can otherwise make host ancestor skills appear project-local and trigger a trust prompt. This fixture policy does not change production trust decisions.
+
 See [interactive transport](test/interactive-transport.md) and [native Herdr panels](test/herdr-panels.md) for prerequisites and commands.
 The Herdr test needs explicit desktop-control authorization. Process-only tests do not certify visible panels.
 Current Windows TUI behavior and live-provider execution remain unverified.
@@ -457,7 +469,8 @@ Extensions may register their own backing file through `globalThis.__pi_interact
 ## Requirements
 
 - [Pi 1.5.0](https://github.com/earendil-works/pi) for the verified interactive transport
-- Node 22.23.2 and a compatible Bash executable
+- Node 22.23.2 with the experimental `node:sqlite` builtin for the [lineage mutex](#crash-released-lineage-mutex-protocol-2)
+- A compatible Bash executable
 - Herdr app and core (`hc`) for native panes
 - Linux util-linux `script` for the process-PTY fallback
 
